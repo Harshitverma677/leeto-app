@@ -42,6 +42,10 @@ const LAST_SEEN_SUB_KEY = '@leetdash_last_sub_ids';
 const REMINDER_KEY = '@leetdash_reminder_settings';
 const THEME_STORAGE_KEY = '@leetdash_theme_preference';
 
+// Cloud Sync Configuration (JSONBin.io)
+const JSONBIN_BIN_ID = '6a8adce9da38895dfe06ade0';
+const JSONBIN_API_KEY = '$2a$10$q/z2mZGd58JtaJVXLOGB0OUhQHg9cSRyh98eCwHMfPeEF2vN5DXhe';
+
 type SortKey = 'solved' | 'streak' | 'acceptance';
 
 interface ReminderSettings {
@@ -158,6 +162,38 @@ export default function App() {
     return () => subscription.remove();
   }, []);
 
+  // Automatic Cloud Sync Function for Cloud Background Worker
+  const syncCloudTracking = async (membersList: string[], token: string | null) => {
+    if (!JSONBIN_BIN_ID || JSONBIN_BIN_ID === 'YOUR_BIN_ID_HERE') return;
+
+    try {
+      const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
+        headers: { 'X-Master-Key': JSONBIN_API_KEY },
+      });
+      const currentData = await res.json();
+      const existingTokens: string[] = currentData.record?.pushTokens || [];
+
+      if (token && !existingTokens.includes(token)) {
+        existingTokens.push(token);
+      }
+
+      await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Master-Key': JSONBIN_API_KEY,
+        },
+        body: JSON.stringify({
+          pushTokens: existingTokens,
+          members: membersList,
+        }),
+      });
+      console.log('☁️ Synced team list to cloud worker successfully');
+    } catch (err) {
+      console.error('Failed to sync to cloud storage:', err);
+    }
+  };
+
   useEffect(() => {
     Animated.parallel([
       Animated.spring(splashScale, {
@@ -194,7 +230,6 @@ export default function App() {
 
   const initApp = async () => {
     try {
-      // Capture Expo Push Token for Background Cloud Worker
       const token = await getDevicePushToken();
       if (token) {
         setPushToken(token);
@@ -243,7 +278,9 @@ export default function App() {
 
       const saved = await AsyncStorage.getItem(STORAGE_KEY);
       if (saved) {
-        await refreshTeam(JSON.parse(saved), false, false, potd?.title);
+        const parsedList: string[] = JSON.parse(saved);
+        await refreshTeam(parsedList, false, false, potd?.title);
+        syncCloudTracking(parsedList, token);
       }
     } catch (e) {
       console.error(e);
@@ -286,6 +323,7 @@ export default function App() {
             setIsTodayTrackScreenOpen(false);
             setDrawerOpen(false);
             setOnboardingInput('');
+            syncCloudTracking([], pushToken);
           },
         },
       ]
@@ -318,6 +356,7 @@ export default function App() {
       list.push(stats.username);
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
       setMembers(sortList([...members, stats], sortBy));
+      syncCloudTracking(list, pushToken);
     }
   };
 
@@ -475,7 +514,9 @@ export default function App() {
     const nextList = sortList([...members, stats], sortBy);
     setMembers(nextList);
     setDrawerAddInput('');
-    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(nextList.map((m) => m.username)));
+    const usernames = nextList.map((m) => m.username);
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(usernames));
+    syncCloudTracking(usernames, pushToken);
     setDrawerOpen(false);
     Alert.alert('Added', `@${stats.username} joined the board!`);
   };
@@ -511,7 +552,7 @@ export default function App() {
 
     if (latestSolveInfo) {
       const problemUrl = getProblemUrlFromTitle(latestSolveInfo.problemTitle);
-      
+
       triggerLocalSolveNotification(
         latestSolveInfo.playerName,
         latestSolveInfo.problemTitle,
@@ -549,7 +590,9 @@ export default function App() {
     setMembers(nextList);
     delete lastSeenSubId.current[username];
     await AsyncStorage.setItem(LAST_SEEN_SUB_KEY, JSON.stringify(lastSeenSubId.current));
-    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(nextList.map((m) => m.username)));
+    const usernames = nextList.map((m) => m.username);
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(usernames));
+    syncCloudTracking(usernames, pushToken);
   };
 
   const openLeetCodeProfile = (username: string) => {
@@ -1532,7 +1575,7 @@ const styles = StyleSheet.create({
   potdSolveText: { color: '#38bdf8', fontSize: 11, fontWeight: '700' },
   searchRow: { paddingHorizontal: 16, marginBottom: 10 },
   searchInput: { borderRadius: 12, paddingHorizontal: 14, paddingVertical: 8, fontSize: 12, borderWidth: 1 },
-  
+
   filterTabs: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, marginBottom: 12, gap: 5 },
   sortLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
   tab: { paddingVertical: 5, paddingHorizontal: 9, borderRadius: 8, borderWidth: 1 },
@@ -1638,7 +1681,7 @@ const styles = StyleSheet.create({
   gridItem: { flex: 1, borderRadius: 14, padding: 14, alignItems: 'center', borderWidth: 1 },
   gridVal: { fontSize: 15, fontWeight: '900' },
   gridLbl: { fontSize: 9, marginTop: 3, textTransform: 'uppercase', fontWeight: '700' },
-  
+
   heatmapHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   heatmapSubText: { fontSize: 10, marginTop: 2 },
   tooltipBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: '#38bdf8' },
