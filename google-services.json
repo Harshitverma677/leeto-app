@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "970864529077",
+    "project_id": "leetdash-mobile",
+    "storage_bucket": "leetdash-mobile.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:970864529077:android:9bc101a0420581c23bf8fc",
+        "android_client_info": {
+          "package_name": "com.leetdash.mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDkmg3Pideb3WfA3cSl_vY3J8mTXtVEGO4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
