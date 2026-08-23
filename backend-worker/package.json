@@ -1,33 +1,15 @@
 {
-  "name": "leetdash-mobile",
+  "name": "backend-worker",
   "version": "1.0.0",
-  "main": "index.ts",
-  "dependencies": {
-    "@react-native-async-storage/async-storage": "2.2.0",
-    "expo": "~54.0.0",
-    "expo-device": "~8.0.10",
-    "expo-notifications": "~0.32.17",
-    "expo-status-bar": "~3.0.9",
-    "expo-updates": "~29.0.20",
-    "lucide-react-native": "^1.33.0",
-    "node-fetch": "^2.7.0",
-    "react": "19.1.0",
-    "react-native": "0.81.5",
-    "react-native-safe-area-context": "~5.6.0"
-  },
-  "devDependencies": {
-    "@types/react": "~19.1.10",
-    "typescript": "~5.9.2"
-  },
+  "main": "worker.js",
   "scripts": {
-    "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "private": true,
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "",
+  "dependencies": {
+    "node-fetch": "^2.7.0"
+  }
 }
