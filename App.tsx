@@ -54,6 +54,11 @@ interface ReminderSettings {
   minute: number;
 }
 
+interface SubscriptionEntry {
+  token: string;
+  tracking: string[];
+}
+
 const darkColors = {
   bg: '#0b0f19',
   cardBg: '#131c2e',
@@ -162,19 +167,32 @@ export default function App() {
     return () => subscription.remove();
   }, []);
 
-  // Automatic Cloud Sync Function for Cloud Background Worker
+  // Automatic Cloud Sync Function: saves targeted per-device subscriptions
   const syncCloudTracking = async (membersList: string[], token: string | null) => {
-    if (!JSONBIN_BIN_ID || JSONBIN_BIN_ID === 'YOUR_BIN_ID_HERE') return;
+    if (!token || !JSONBIN_BIN_ID || JSONBIN_BIN_ID === 'YOUR_BIN_ID_HERE') return;
 
     try {
       const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
         headers: { 'X-Master-Key': JSONBIN_API_KEY },
       });
       const currentData = await res.json();
-      const existingTokens: string[] = currentData.record?.pushTokens || [];
+      let subscriptions: SubscriptionEntry[] = currentData.record?.subscriptions || [];
 
-      if (token && !existingTokens.includes(token)) {
-        existingTokens.push(token);
+      // Ensure legacy array structure is cleaned up if it was previously flat
+      if (!Array.isArray(subscriptions)) {
+        subscriptions = [];
+      }
+
+      const cleanMembers = Array.from(new Set(membersList.map((m) => m.trim()).filter(Boolean)));
+      const existingSubIndex = subscriptions.findIndex((sub) => sub.token === token);
+
+      if (existingSubIndex >= 0) {
+        subscriptions[existingSubIndex].tracking = cleanMembers;
+      } else {
+        subscriptions.push({
+          token: token,
+          tracking: cleanMembers,
+        });
       }
 
       await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
@@ -184,13 +202,12 @@ export default function App() {
           'X-Master-Key': JSONBIN_API_KEY,
         },
         body: JSON.stringify({
-          pushTokens: existingTokens,
-          members: membersList,
+          subscriptions,
         }),
       });
-      console.log('☁️ Synced team list to cloud worker successfully');
+      console.log('☁️ Synced device subscriptions to JSONBin successfully');
     } catch (err) {
-      console.error('Failed to sync to cloud storage:', err);
+      console.error('Failed to sync subscriptions to cloud:', err);
     }
   };
 
@@ -233,10 +250,6 @@ export default function App() {
       const token = await getDevicePushToken();
       if (token) {
         setPushToken(token);
-        console.log('====================================');
-        console.log('🔑 EXPO PUSH TOKEN:');
-        console.log(token);
-        console.log('====================================');
       }
 
       const savedTheme = await AsyncStorage.getItem(THEME_STORAGE_KEY);

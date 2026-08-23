@@ -15,13 +15,29 @@ async function getCloudTrackingConfig() {
       headers: { 'X-Master-Key': JSONBIN_API_KEY },
     });
     const data = await res.json();
+    const record = data.record || {};
+
+    // Support both new structured format (subscriptions) and legacy format
+    const subscriptions = record.subscriptions || [];
+    let usersToTrack = [];
+
+    if (subscriptions.length > 0) {
+      // Gather all unique usernames across all devices
+      const allMembers = subscriptions.flatMap((sub) => sub.tracking || []);
+      usersToTrack = Array.from(new Set(allMembers));
+    } else {
+      // Fallback for legacy format { pushTokens: [], members: [] }
+      usersToTrack = record.members || [];
+    }
+
     return {
-      subscribers: data.record?.pushTokens || [],
-      usersToTrack: data.record?.members || [],
+      subscriptions,
+      legacyTokens: record.pushTokens || [],
+      usersToTrack,
     };
   } catch (err) {
     console.error('Error fetching dynamic cloud config:', err.message);
-    return { subscribers: [], usersToTrack: [] };
+    return { subscriptions: [], legacyTokens: [], usersToTrack: [] };
   }
 }
 
@@ -83,7 +99,7 @@ async function fetchUserSolvesAndProfile(username) {
 }
 
 async function sendRemoteNotification(subscribers, title, body, url) {
-  if (subscribers.length === 0) return;
+  if (!subscribers || subscribers.length === 0) return;
 
   const messages = subscribers.map((token) => ({
     to: token,
@@ -111,7 +127,7 @@ async function sendRemoteNotification(subscribers, title, body, url) {
 
 async function runWorker() {
   console.log(`[${new Date().toISOString()}] Fetching cloud tracking config...`);
-  const { subscribers, usersToTrack } = await getCloudTrackingConfig();
+  const { subscriptions, legacyTokens, usersToTrack } = await getCloudTrackingConfig();
 
   if (usersToTrack.length === 0) {
     console.log('No members configured to track.');
@@ -130,8 +146,19 @@ async function runWorker() {
 
     if (previousId && previousId !== latestSolve.id) {
       console.log(`New solve detected for ${displayName} (@${username}): ${latestSolve.title}`);
+
+      // Identify specifically which device tokens subscribe to this user
+      let targetTokens = [];
+      if (subscriptions.length > 0) {
+        targetTokens = subscriptions
+          .filter((sub) => sub.tracking && sub.tracking.includes(username))
+          .map((sub) => sub.token);
+      } else {
+        targetTokens = legacyTokens;
+      }
+
       await sendRemoteNotification(
-        subscribers,
+        targetTokens,
         `🎯 ${displayName} solved a problem!`,
         `"${latestSolve.title}" was just completed. Tap to view problem.`,
         `https://leetcode.com/problems/${latestSolve.titleSlug}/`
