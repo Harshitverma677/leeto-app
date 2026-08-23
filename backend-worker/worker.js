@@ -12,12 +12,12 @@ const JSONBIN_API_KEY = '$2a$10$q/z2mZGd58JtaJVXLOGB0OUhQHg9cSRyh98eCwHMfPeEF2vN
 async function getCloudTrackingConfig() {
   try {
     const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
-      headers: { 'X-Master-Key': JSONBIN_API_KEY }
+      headers: { 'X-Master-Key': JSONBIN_API_KEY },
     });
     const data = await res.json();
     return {
       subscribers: data.record?.pushTokens || [],
-      usersToTrack: data.record?.members || []
+      usersToTrack: data.record?.members || [],
     };
   } catch (err) {
     console.error('Error fetching dynamic cloud config:', err.message);
@@ -40,9 +40,15 @@ function saveSolves(data) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
 }
 
-async function fetchLatestAcceptedSolve(username) {
+// Queries both latest solve and user's real display name
+async function fetchUserSolvesAndProfile(username) {
   const query = `
-    query getRecentSubmissions($username: String!) {
+    query getUserData($username: String!) {
+      matchedUser(username: $username) {
+        profile {
+          realName
+        }
+      }
       recentAcSubmissionList(username: $username, limit: 1) {
         id
         title
@@ -57,16 +63,22 @@ async function fetchLatestAcceptedSolve(username) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0'
+        'User-Agent': 'Mozilla/5.0',
       },
       body: JSON.stringify({ query, variables: { username } }),
     });
 
     const json = await res.json();
-    return json.data?.recentAcSubmissionList?.[0] || null;
+    const realName = json.data?.matchedUser?.profile?.realName?.trim() || null;
+    const latestSolve = json.data?.recentAcSubmissionList?.[0] || null;
+
+    return {
+      displayName: realName || username,
+      latestSolve,
+    };
   } catch (err) {
     console.error(`Failed to fetch for ${username}:`, err.message);
-    return null;
+    return { displayName: username, latestSolve: null };
   }
 }
 
@@ -85,7 +97,7 @@ async function sendRemoteNotification(subscribers, title, body, url) {
     const response = await fetch(EXPO_PUSH_ENDPOINT, {
       method: 'POST',
       headers: {
-        'Accept': 'application/json',
+        Accept: 'application/json',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(messages),
@@ -111,23 +123,23 @@ async function runWorker() {
   let updated = false;
 
   for (const username of usersToTrack) {
-    const latest = await fetchLatestAcceptedSolve(username);
-    if (!latest) continue;
+    const { displayName, latestSolve } = await fetchUserSolvesAndProfile(username);
+    if (!latestSolve) continue;
 
     const previousId = lastSolves[username];
 
-    if (previousId && previousId !== latest.id) {
-      console.log(`New solve detected for ${username}: ${latest.title}`);
+    if (previousId && previousId !== latestSolve.id) {
+      console.log(`New solve detected for ${displayName} (@${username}): ${latestSolve.title}`);
       await sendRemoteNotification(
         subscribers,
-        `🎯 ${username} solved a problem!`,
-        `"${latest.title}" was just completed. Tap to view problem.`,
-        `https://leetcode.com/problems/${latest.titleSlug}/`
+        `🎯 ${displayName} solved a problem!`,
+        `"${latestSolve.title}" was just completed. Tap to view problem.`,
+        `https://leetcode.com/problems/${latestSolve.titleSlug}/`
       );
     }
 
-    if (previousId !== latest.id) {
-      lastSolves[username] = latest.id;
+    if (previousId !== latestSolve.id) {
+      lastSolves[username] = latestSolve.id;
       updated = true;
     }
   }
