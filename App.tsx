@@ -167,47 +167,70 @@ export default function App() {
     return () => subscription.remove();
   }, []);
 
-  // Automatic Cloud Sync Function: saves targeted per-device subscriptions
-  const syncCloudTracking = async (membersList: string[], token: string | null) => {
-    if (!token || !JSONBIN_BIN_ID || JSONBIN_BIN_ID === 'YOUR_BIN_ID_HERE') return;
+  const syncCloudTracking = async (membersList: string[], tokenToUse?: string | null) => {
+    let targetToken = tokenToUse !== undefined ? tokenToUse : pushToken;
+
+    if (!targetToken) {
+      targetToken = await getDevicePushToken();
+      if (targetToken) {
+        setPushToken(targetToken);
+      }
+    }
+
+    if (!targetToken) {
+      Alert.alert('DEBUG: TOKEN ERROR', 'Could not get Expo Push Token. Grant notification permissions.');
+      return;
+    }
 
     try {
       const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
+        method: 'GET',
         headers: { 'X-Master-Key': JSONBIN_API_KEY },
       });
+
+      if (!res.ok) {
+        const readErr = await res.text();
+        Alert.alert('DEBUG: JSONBIN READ ERROR', `Status: ${res.status}\n${readErr}`);
+        return;
+      }
+
       const currentData = await res.json();
       let subscriptions: SubscriptionEntry[] = currentData.record?.subscriptions || [];
 
-      // Ensure legacy array structure is cleaned up if it was previously flat
       if (!Array.isArray(subscriptions)) {
         subscriptions = [];
       }
 
       const cleanMembers = Array.from(new Set(membersList.map((m) => m.trim()).filter(Boolean)));
-      const existingSubIndex = subscriptions.findIndex((sub) => sub.token === token);
+      const existingSubIndex = subscriptions.findIndex((sub) => sub.token === targetToken);
 
       if (existingSubIndex >= 0) {
         subscriptions[existingSubIndex].tracking = cleanMembers;
       } else {
         subscriptions.push({
-          token: token,
+          token: targetToken,
           tracking: cleanMembers,
         });
       }
 
-      await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
+      const putRes = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
           'X-Master-Key': JSONBIN_API_KEY,
         },
-        body: JSON.stringify({
-          subscriptions,
-        }),
+        body: JSON.stringify({ subscriptions }),
       });
-      console.log('☁️ Synced device subscriptions to JSONBin successfully');
-    } catch (err) {
-      console.error('Failed to sync subscriptions to cloud:', err);
+
+      if (!putRes.ok) {
+        const putErr = await putRes.text();
+        Alert.alert('DEBUG: JSONBIN WRITE ERROR', `Status: ${putRes.status}\n${putErr}`);
+        return;
+      }
+
+      console.log('☁️ Synced device subscriptions to JSONBin successfully:', targetToken);
+    } catch (err: any) {
+      Alert.alert('DEBUG: NETWORK ERROR', err.message || JSON.stringify(err));
     }
   };
 
@@ -232,7 +255,6 @@ export default function App() {
       }),
     ]).start();
 
-    requestNotificationPermissions();
     initApp();
 
     const interval = setInterval(() => {
@@ -247,6 +269,7 @@ export default function App() {
 
   const initApp = async () => {
     try {
+      await requestNotificationPermissions();
       const token = await getDevicePushToken();
       if (token) {
         setPushToken(token);
@@ -290,10 +313,14 @@ export default function App() {
       }
 
       const saved = await AsyncStorage.getItem(STORAGE_KEY);
+      const parsedList: string[] = saved ? JSON.parse(saved) : (savedOwner ? [savedOwner] : []);
+
       if (saved) {
-        const parsedList: string[] = JSON.parse(saved);
         await refreshTeam(parsedList, false, false, potd?.title);
-        syncCloudTracking(parsedList, token);
+      }
+
+      if (token) {
+        await syncCloudTracking(parsedList, token);
       }
     } catch (e) {
       console.error(e);
@@ -369,7 +396,12 @@ export default function App() {
       list.push(stats.username);
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
       setMembers(sortList([...members, stats], sortBy));
-      syncCloudTracking(list, pushToken);
+
+      const token = pushToken || (await getDevicePushToken());
+      if (token) {
+        setPushToken(token);
+        syncCloudTracking(list, token);
+      }
     }
   };
 
@@ -478,7 +510,7 @@ export default function App() {
             const problemUrl = getProblemUrlFromTitle(latestSub.title);
             const playerName = stats.realName || stats.username;
 
-            triggerLocalSolveNotification(
+            await triggerLocalSolveNotification(
               playerName,
               latestSub.title,
               problemUrl
@@ -534,59 +566,63 @@ export default function App() {
     Alert.alert('Added', `@${stats.username} joined the board!`);
   };
 
-  const testSolveAlert = () => {
-    if (members.length === 0) {
-      Alert.alert('Add a member first', 'Add at least one LeetCode user to test alerts.');
-      return;
-    }
+  const testSolveAlert = async () => {
+    try {
+      if (members.length === 0) {
+        Alert.alert('Add a member first', 'Add at least one LeetCode user to test alerts.');
+        return;
+      }
 
-    let latestSolveInfo: {
-      playerName: string;
-      username: string;
-      problemTitle: string;
-      rawTimestamp: number;
-    } | null = null;
+      let latestSolveInfo: {
+        playerName: string;
+        username: string;
+        problemTitle: string;
+        rawTimestamp: number;
+      } | null = null;
 
-    for (const member of members) {
-      if (member.recentSubmissions && member.recentSubmissions.length > 0) {
-        const topSub = member.recentSubmissions[0];
-        const subTime = topSub.rawTimestamp || 0;
+      for (const member of members) {
+        if (member.recentSubmissions && member.recentSubmissions.length > 0) {
+          const topSub = member.recentSubmissions[0];
+          const subTime = topSub.rawTimestamp || 0;
 
-        if (!latestSolveInfo || subTime > latestSolveInfo.rawTimestamp) {
-          latestSolveInfo = {
-            playerName: member.realName || member.username,
-            username: member.username,
-            problemTitle: topSub.title,
-            rawTimestamp: subTime,
-          };
+          if (!latestSolveInfo || subTime > latestSolveInfo.rawTimestamp) {
+            latestSolveInfo = {
+              playerName: member.realName || member.username,
+              username: member.username,
+              problemTitle: topSub.title,
+              rawTimestamp: subTime,
+            };
+          }
         }
       }
+
+      if (latestSolveInfo) {
+        const problemUrl = getProblemUrlFromTitle(latestSolveInfo.problemTitle);
+
+        await triggerLocalSolveNotification(
+          latestSolveInfo.playerName,
+          latestSolveInfo.problemTitle,
+          problemUrl
+        );
+        broadcastSolveEvent(
+          latestSolveInfo.username,
+          latestSolveInfo.playerName,
+          latestSolveInfo.problemTitle,
+          problemUrl
+        );
+        return;
+      }
+
+      const fallbackUser = members[0];
+      const fallbackProblem = dailyProblem?.title || 'Two Sum';
+      const fallbackUrl = dailyProblem?.link || getProblemUrlFromTitle(fallbackProblem);
+      const playerName = fallbackUser.realName || fallbackUser.username;
+
+      await triggerLocalSolveNotification(playerName, fallbackProblem, fallbackUrl);
+      broadcastSolveEvent(fallbackUser.username, playerName, fallbackProblem, fallbackUrl);
+    } catch (err: any) {
+      Alert.alert('Notification Error', err.message || JSON.stringify(err));
     }
-
-    if (latestSolveInfo) {
-      const problemUrl = getProblemUrlFromTitle(latestSolveInfo.problemTitle);
-
-      triggerLocalSolveNotification(
-        latestSolveInfo.playerName,
-        latestSolveInfo.problemTitle,
-        problemUrl
-      );
-      broadcastSolveEvent(
-        latestSolveInfo.username,
-        latestSolveInfo.playerName,
-        latestSolveInfo.problemTitle,
-        problemUrl
-      );
-      return;
-    }
-
-    const fallbackUser = members[0];
-    const fallbackProblem = dailyProblem?.title || 'Two Sum';
-    const fallbackUrl = dailyProblem?.link || getProblemUrlFromTitle(fallbackProblem);
-    const playerName = fallbackUser.realName || fallbackUser.username;
-
-    triggerLocalSolveNotification(playerName, fallbackProblem, fallbackUrl);
-    broadcastSolveEvent(fallbackUser.username, playerName, fallbackProblem, fallbackUrl);
   };
 
   const handleSortChange = (key: SortKey) => {
@@ -981,7 +1017,7 @@ export default function App() {
               >
                 <View style={styles.weeksRowContainer}>
                   {selectedMember.heatmapWeeks.map((week, wIdx) => (
-                    <View key={wIdx} style={styles.weekColumn}>
+                    <View key={week.monthLabel || wIdx} style={styles.weekColumn}>
                       <View style={styles.monthHeaderSlot}>
                         {week.monthLabel ? (
                           <Text style={[styles.monthHeaderText, { color: colors.textSecondary }]}>{week.monthLabel}</Text>
@@ -990,7 +1026,7 @@ export default function App() {
 
                       {week.days.map((day, dIdx) => (
                         <TouchableOpacity
-                          key={dIdx}
+                          key={day?.date || dIdx}
                           activeOpacity={day ? 0.7 : 1}
                           onPress={() => day && setSelectedDayInfo(day)}
                           style={[
@@ -1428,6 +1464,20 @@ export default function App() {
                 </TouchableOpacity>
               )}
 
+              {/* Force Manual Sync Button */}
+              <TouchableOpacity
+                style={[styles.forceSyncBtn, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}
+                onPress={async () => {
+                  const token = pushToken || (await getDevicePushToken());
+                  if (token) setPushToken(token);
+                  const list = members.map((m) => m.username);
+                  await syncCloudTracking(list, token);
+                  Alert.alert('Cloud Sync Triggered', 'Completed manual sync routine.');
+                }}
+              >
+                <Text style={[styles.forceSyncBtnText, { color: colors.primary }]}>⚡ Force Cloud Sync Now</Text>
+              </TouchableOpacity>
+
               {/* Sign Out Button */}
               <TouchableOpacity
                 style={styles.signOutBtn}
@@ -1650,6 +1700,8 @@ const styles = StyleSheet.create({
   pushTokenBox: { marginTop: 14, padding: 10, borderRadius: 10, borderWidth: 1 },
   pushTokenLabel: { fontSize: 10, fontWeight: '700', marginBottom: 2 },
   pushTokenVal: { fontSize: 11, fontWeight: '600' },
+  forceSyncBtn: { marginTop: 10, paddingVertical: 10, borderRadius: 10, borderWidth: 1, alignItems: 'center' },
+  forceSyncBtnText: { fontSize: 12, fontWeight: '800' },
   signOutBtn: { marginTop: 18, paddingVertical: 12, borderRadius: 12, alignItems: 'center', backgroundColor: '#ef444415', borderWidth: 1, borderColor: '#ef444450' },
   signOutBtnText: { color: '#ef4444', fontSize: 13, fontWeight: '800' },
 
