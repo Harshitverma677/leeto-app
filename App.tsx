@@ -42,7 +42,6 @@ const LAST_SEEN_SUB_KEY = '@leetdash_last_sub_ids';
 const REMINDER_KEY = '@leetdash_reminder_settings';
 const THEME_STORAGE_KEY = '@leetdash_theme_preference';
 
-// Cloud Sync Configuration (JSONBin.io)
 const JSONBIN_BIN_ID = '6a8adce9da38895dfe06ade0';
 const JSONBIN_API_KEY = '$2a$10$q/z2mZGd58JtaJVXLOGB0OUhQHg9cSRyh98eCwHMfPeEF2vN5DXhe';
 
@@ -59,24 +58,39 @@ interface SubscriptionEntry {
   tracking: string[];
 }
 
+interface DayOption {
+  label: string;
+  subLabel: string;
+  dateStr: string;
+  startTimestampUtc: number;
+  endTimestampUtc: number;
+}
+
 const darkColors = {
-  bg: '#0b0f19',
-  cardBg: '#131c2e',
-  inputBg: '#0b0f19',
+  bg: '#05070d',
+  cardBg: '#0f172a',
+  subCardBg: '#1e293b50',
+  inputBg: '#0b1120',
   border: '#1e293b',
   borderLight: '#334155',
   textPrimary: '#f8fafc',
   textSecondary: '#94a3b8',
   textMuted: '#64748b',
-  primary: '#f97316',
-  primaryBg: '#f9731615',
-  subCardBg: '#0b0f19',
+  primary: '#ff9900',
+  primaryBg: '#ff990020',
+  primaryBorder: '#ff990060',
+  cyan: '#00f2fe',
+  cyanBg: '#00f2fe18',
+  green: '#10b981',
+  yellow: '#f59e0b',
+  red: '#f43f5e',
   statusBar: 'light-content' as const,
 };
 
 const lightColors = {
-  bg: '#f1f5f9',
+  bg: '#f8fafc',
   cardBg: '#ffffff',
+  subCardBg: '#f1f5f9',
   inputBg: '#f8fafc',
   border: '#e2e8f0',
   borderLight: '#cbd5e1',
@@ -85,8 +99,48 @@ const lightColors = {
   textMuted: '#94a3b8',
   primary: '#ea580c',
   primaryBg: '#ea580c15',
-  subCardBg: '#f8fafc',
+  primaryBorder: '#ea580c50',
+  cyan: '#0284c7',
+  cyanBg: '#0284c715',
+  green: '#059669',
+  yellow: '#d97706',
+  red: '#e11d48',
   statusBar: 'dark-content' as const,
+};
+
+const getPast7UtcDays = (): DayOption[] => {
+  const days: DayOption[] = [];
+  const now = new Date();
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i, 0, 0, 0));
+    const startTimestampUtc = Math.floor(d.getTime() / 1000);
+    const endTimestampUtc = startTimestampUtc + 86399;
+
+    let label = `${dayNames[d.getUTCDay()]}`;
+    if (i === 0) label = 'Today';
+    if (i === 1) label = 'Yesterday';
+
+    const subLabel = `${monthNames[d.getUTCMonth()]} ${d.getUTCDate()}`;
+    const dateStr = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+
+    days.push({
+      label,
+      subLabel,
+      dateStr,
+      startTimestampUtc,
+      endTimestampUtc,
+    });
+  }
+
+  return days;
+};
+
+const getUtcDateString = (): string => {
+  const now = new Date();
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`;
 };
 
 export default function App() {
@@ -105,7 +159,10 @@ export default function App() {
   const [members, setMembers] = useState<LeetCodeStats[]>([]);
   const [sortBy, setSortBy] = useState<SortKey>('solved');
   const [selectedMember, setSelectedMember] = useState<LeetCodeStats | null>(null);
+
   const [isTodayTrackScreenOpen, setIsTodayTrackScreenOpen] = useState(false);
+  const [selectedDayIndex, setSelectedDayIndex] = useState<number>(0);
+
   const [dailyProblem, setDailyProblem] = useState<DailyChallenge | null>(null);
   const [selectedDayInfo, setSelectedDayInfo] = useState<HeatmapSquare | null>(null);
 
@@ -129,12 +186,14 @@ export default function App() {
 
   const heatmapScrollRef = useRef<ScrollView>(null);
   const lastSeenSubId = useRef<Record<string, string>>({});
-  const lastReminderTriggeredDate = useRef<string>('');
+  const lastReminderTriggeredUtcDate = useRef<string>('');
   const membersRef = useRef<LeetCodeStats[]>([]);
   const ownerHandleRef = useRef<string | null>(null);
   const dailyProblemRef = useRef<DailyChallenge | null>(null);
   const reminderConfigRef = useRef<ReminderSettings>(reminderConfig);
   const sortByRef = useRef<SortKey>(sortBy);
+
+  const past7Days = getPast7UtcDays();
 
   useEffect(() => {
     membersRef.current = members;
@@ -177,10 +236,7 @@ export default function App() {
       }
     }
 
-    if (!targetToken) {
-      Alert.alert('DEBUG: TOKEN ERROR', 'Could not get Expo Push Token. Grant notification permissions.');
-      return;
-    }
+    if (!targetToken) return;
 
     try {
       const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
@@ -188,11 +244,7 @@ export default function App() {
         headers: { 'X-Master-Key': JSONBIN_API_KEY },
       });
 
-      if (!res.ok) {
-        const readErr = await res.text();
-        Alert.alert('DEBUG: JSONBIN READ ERROR', `Status: ${res.status}\n${readErr}`);
-        return;
-      }
+      if (!res.ok) return;
 
       const currentData = await res.json();
       let subscriptions: SubscriptionEntry[] = currentData.record?.subscriptions || [];
@@ -213,7 +265,7 @@ export default function App() {
         });
       }
 
-      const putRes = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
+      await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -221,17 +273,7 @@ export default function App() {
         },
         body: JSON.stringify({ subscriptions }),
       });
-
-      if (!putRes.ok) {
-        const putErr = await putRes.text();
-        Alert.alert('DEBUG: JSONBIN WRITE ERROR', `Status: ${putRes.status}\n${putErr}`);
-        return;
-      }
-
-      console.log('☁️ Synced device subscriptions to JSONBin successfully:', targetToken);
-    } catch (err: any) {
-      Alert.alert('DEBUG: NETWORK ERROR', err.message || JSON.stringify(err));
-    }
+    } catch (_) {}
   };
 
   useEffect(() => {
@@ -413,10 +455,10 @@ export default function App() {
     if (!currentOwner) return;
 
     const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
+    const todayUtcDateStr = getUtcDateString();
 
     if (
-      lastReminderTriggeredDate.current !== todayStr &&
+      lastReminderTriggeredUtcDate.current !== todayUtcDateStr &&
       now.getHours() === config.hour &&
       now.getMinutes() >= config.minute
     ) {
@@ -425,7 +467,7 @@ export default function App() {
       );
 
       if (ownerMember && !ownerMember.solvedDailyToday && dailyProblemRef.current) {
-        lastReminderTriggeredDate.current = todayStr;
+        lastReminderTriggeredUtcDate.current = todayUtcDateStr;
         triggerStreakShieldAlert(dailyProblemRef.current.title, dailyProblemRef.current.link);
       }
     }
@@ -566,65 +608,6 @@ export default function App() {
     Alert.alert('Added', `@${stats.username} joined the board!`);
   };
 
-  const testSolveAlert = async () => {
-    try {
-      if (members.length === 0) {
-        Alert.alert('Add a member first', 'Add at least one LeetCode user to test alerts.');
-        return;
-      }
-
-      let latestSolveInfo: {
-        playerName: string;
-        username: string;
-        problemTitle: string;
-        rawTimestamp: number;
-      } | null = null;
-
-      for (const member of members) {
-        if (member.recentSubmissions && member.recentSubmissions.length > 0) {
-          const topSub = member.recentSubmissions[0];
-          const subTime = topSub.rawTimestamp || 0;
-
-          if (!latestSolveInfo || subTime > latestSolveInfo.rawTimestamp) {
-            latestSolveInfo = {
-              playerName: member.realName || member.username,
-              username: member.username,
-              problemTitle: topSub.title,
-              rawTimestamp: subTime,
-            };
-          }
-        }
-      }
-
-      if (latestSolveInfo) {
-        const problemUrl = getProblemUrlFromTitle(latestSolveInfo.problemTitle);
-
-        await triggerLocalSolveNotification(
-          latestSolveInfo.playerName,
-          latestSolveInfo.problemTitle,
-          problemUrl
-        );
-        broadcastSolveEvent(
-          latestSolveInfo.username,
-          latestSolveInfo.playerName,
-          latestSolveInfo.problemTitle,
-          problemUrl
-        );
-        return;
-      }
-
-      const fallbackUser = members[0];
-      const fallbackProblem = dailyProblem?.title || 'Two Sum';
-      const fallbackUrl = dailyProblem?.link || getProblemUrlFromTitle(fallbackProblem);
-      const playerName = fallbackUser.realName || fallbackUser.username;
-
-      await triggerLocalSolveNotification(playerName, fallbackProblem, fallbackUrl);
-      broadcastSolveEvent(fallbackUser.username, playerName, fallbackProblem, fallbackUrl);
-    } catch (err: any) {
-      Alert.alert('Notification Error', err.message || JSON.stringify(err));
-    }
-  };
-
   const handleSortChange = (key: SortKey) => {
     setSortBy(key);
     setMembers(sortList(members, key));
@@ -656,19 +639,19 @@ export default function App() {
     }
   };
 
-  const getTodaySolvesGroupedByMember = () => {
-    const now = new Date();
-    const startOfTodayUtc = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / 1000);
-
+  const getSubmissionsForDay = (day: DayOption) => {
     return members.map((member) => {
-      const todaySubmissions = (member.recentSubmissions || []).filter((sub) => {
+      const filteredSubmissions = (member.recentSubmissions || []).filter((sub) => {
         if (!sub.rawTimestamp || sub.rawTimestamp === 0) return false;
-        return sub.rawTimestamp >= startOfTodayUtc;
+        return (
+          sub.rawTimestamp >= day.startTimestampUtc &&
+          sub.rawTimestamp <= day.endTimestampUtc
+        );
       });
 
       return {
         ...member,
-        todaySubmissions,
+        filteredSubmissions,
       };
     });
   };
@@ -682,23 +665,23 @@ export default function App() {
   });
 
   const getRankBadgeDesign = (index: number) => {
-    if (index === 0) return { bg: '#eab30825', border: '#eab308', text: '#facc15', label: '1 👑' };
-    if (index === 1) return { bg: isDarkMode ? '#94a3b825' : '#cbd5e150', border: '#94a3b8', text: isDarkMode ? '#cbd5e1' : '#475569', label: '2' };
-    if (index === 2) return { bg: '#b4530925', border: '#b45309', text: '#d97706', label: '3' };
+    if (index === 0) return { bg: '#ff990025', border: '#ff9900', text: '#ff9900', label: '1 👑' };
+    if (index === 1) return { bg: isDarkMode ? '#00f2fe20' : '#e2e8f0', border: '#00f2fe', text: isDarkMode ? '#00f2fe' : '#0284c7', label: '2' };
+    if (index === 2) return { bg: '#8b5cf625', border: '#8b5cf6', text: '#a78bfa', label: '3' };
     return { bg: colors.subCardBg, border: colors.border, text: colors.textMuted, label: `${index + 1}` };
   };
 
-  const getDifficultyColor = (diff: string) => {
-    if (diff === 'Easy') return '#10b981';
-    if (diff === 'Medium') return '#f59e0b';
-    return '#ef4444';
+  const getDifficultyMeta = (diff?: string) => {
+    if (diff === 'Easy') return { letter: 'E', color: colors.green };
+    if (diff === 'Hard') return { letter: 'H', color: colors.red };
+    return { letter: 'M', color: colors.yellow };
   };
 
   const getLeetCodeMatrixSquareColor = (level: number) => {
-    if (level === 3) return '#00b8a3';
-    if (level === 2) return '#26a641';
-    if (level === 1) return isDarkMode ? '#0e4429' : '#86efac';
-    return isDarkMode ? '#161b22' : '#e2e8f0';
+    if (level === 3) return '#00f2fe';
+    if (level === 2) return '#10b981';
+    if (level === 1) return isDarkMode ? '#064e3b' : '#a7f3d0';
+    return isDarkMode ? '#1e293b' : '#e2e8f0';
   };
 
   const formatReminderTime = (hour: number, minute: number) => {
@@ -710,8 +693,8 @@ export default function App() {
 
   if (isSplashVisible) {
     return (
-      <View style={[styles.splashFullOverlay, { backgroundColor: '#0b0f19' }]}>
-        <StatusBar barStyle="light-content" backgroundColor="#0b0f19" />
+      <View style={[styles.splashFullOverlay, { backgroundColor: '#05070d' }]}>
+        <StatusBar barStyle="light-content" backgroundColor="#05070d" />
         <Animated.View
           style={[
             styles.splashContentCenter,
@@ -722,11 +705,12 @@ export default function App() {
           ]}
         >
           <View style={styles.splashGlowHalo} />
-
+          <View style={styles.splashBadgeIcon}>
+            <Text style={{ fontSize: 34 }}>⚡</Text>
+          </View>
           <Animated.Text style={[styles.splashTitle, { opacity: splashOpacity }]}>
             LEETO
           </Animated.Text>
-
           <Animated.View style={[styles.splashSubBadge, { opacity: splashSubOpacity }]}>
             <Text style={styles.splashSubBadgeText}>LEETCODE TEAM COMPASS</Text>
           </Animated.View>
@@ -738,13 +722,16 @@ export default function App() {
   if (!ownerHandle) {
     return (
       <SafeAreaProvider>
-        <SafeAreaView style={[styles.container, { backgroundColor: colors.bg, justifyContent: 'center', padding: 24 }]}>
+        <SafeAreaView style={[styles.container, { backgroundColor: colors.bg, justifyContent: 'center', padding: 20 }]}>
           <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
-          <View style={[styles.onboardingCard, { backgroundColor: colors.cardBg, borderColor: `${colors.primary}50` }]}>
-            <Text style={[styles.onboardingBadge, { color: colors.primary }]}>WELCOME TO LEETO</Text>
-            <Text style={[styles.onboardingTitle, { color: colors.textPrimary }]}>Link Your Profile</Text>
+          <View style={[styles.onboardingCard, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}>
+            <View style={[styles.onboardingIconRing, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
+              <Text style={{ fontSize: 30 }}>🔥</Text>
+            </View>
+            <Text style={[styles.onboardingBadge, { color: colors.primary }]}>GET STARTED</Text>
+            <Text style={[styles.onboardingTitle, { color: colors.textPrimary }]}>Connect Your Handle</Text>
             <Text style={[styles.onboardingSub, { color: colors.textSecondary }]}>
-              Enter your LeetCode username. Your daily streak alerts will be tied exclusively to this account.
+              Link your LeetCode profile to monitor team rankings and receive automated streak shields.
             </Text>
 
             <TextInput
@@ -765,7 +752,7 @@ export default function App() {
               {onboardingLoading ? (
                 <ActivityIndicator color="#fff" />
               ) : (
-                <Text style={styles.onboardingBtnText}>Start Tracking 🚀</Text>
+                <Text style={styles.onboardingBtnText}>Start Tracking ⚡</Text>
               )}
             </TouchableOpacity>
           </View>
@@ -774,8 +761,14 @@ export default function App() {
     );
   }
 
-  const groupedTodayTracks = getTodaySolvesGroupedByMember();
-  const totalSolvesTodayCount = groupedTodayTracks.reduce((acc, curr) => acc + curr.todaySubmissions.length, 0);
+  const activeDay = past7Days[selectedDayIndex] || past7Days[0];
+  const todayDayOption = past7Days[0];
+  const todaySolvesMembers = getSubmissionsForDay(todayDayOption);
+  const totalSolvesTodayCount = todaySolvesMembers.reduce((acc, curr) => acc + curr.filteredSubmissions.length, 0);
+
+  const selectedDayTracks = getSubmissionsForDay(activeDay);
+  const totalSelectedDayCount = selectedDayTracks.reduce((acc, curr) => acc + curr.filteredSubmissions.length, 0);
+
   const ownerStats = members.find((m) => m.username.toLowerCase() === ownerHandle.toLowerCase());
 
   if (isTodayTrackScreenOpen) {
@@ -790,34 +783,98 @@ export default function App() {
               onPress={() => setIsTodayTrackScreenOpen(false)}
               activeOpacity={0.7}
             >
-              <Text style={[styles.navBackBtnText, { color: colors.textPrimary }]}>← Back to Board</Text>
+              <Text style={[styles.navBackBtnText, { color: colors.textPrimary }]}>← Back</Text>
             </TouchableOpacity>
 
-            <View style={[styles.todayCountTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              <Text style={[styles.todayCountTagText, { color: colors.primary }]}>Today: {totalSolvesTodayCount} Solved</Text>
+            <View style={[styles.todayCountTag, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}>
+              <Text style={[styles.todayCountTagText, { color: colors.primary }]}>
+                ⚡ {totalSelectedDayCount} Solved ({activeDay.label})
+              </Text>
             </View>
           </View>
 
-          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.profileScroll}>
-            <View style={[styles.todayTrackHero, { backgroundColor: colors.cardBg, borderColor: `${colors.primary}40` }]}>
-              <Text style={[styles.todayTrackHeroTitle, { color: colors.textPrimary }]}>🎯 Today's Team Activity</Text>
-              <Text style={[styles.todayTrackHeroSub, { color: colors.textSecondary }]}>
-                Real-time questions solved today per teammate. Automatically resets at midnight.
-              </Text>
-            </View>
+          {/* 7-Day Day Selector Carousel */}
+          <View style={{ marginTop: 12, marginBottom: 12 }}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.dayPickerScroll}
+            >
+              {past7Days.map((day, idx) => {
+                const isSelected = selectedDayIndex === idx;
+                const daySolves = getSubmissionsForDay(day);
+                const daySolveTotal = daySolves.reduce((acc, curr) => acc + curr.filteredSubmissions.length, 0);
 
-            {groupedTodayTracks.map((person) => {
-              const count = person.todaySubmissions.length;
+                return (
+                  <TouchableOpacity
+                    key={day.dateStr}
+                    style={[
+                      styles.dayPickerCard,
+                      { backgroundColor: colors.cardBg, borderColor: colors.border },
+                      isSelected && {
+                        backgroundColor: colors.primaryBg,
+                        borderColor: colors.primary,
+                      },
+                    ]}
+                    onPress={() => setSelectedDayIndex(idx)}
+                    activeOpacity={0.8}
+                  >
+                    <Text
+                      style={[
+                        styles.dayPickerLabel,
+                        { color: colors.textSecondary },
+                        isSelected && { color: colors.primary, fontWeight: '900' },
+                      ]}
+                    >
+                      {day.label}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.dayPickerSubLabel,
+                        { color: colors.textMuted },
+                        isSelected && { color: colors.textPrimary },
+                      ]}
+                    >
+                      {day.subLabel}
+                    </Text>
+                    <View
+                      style={[
+                        styles.dayPickerCountBadge,
+                        daySolveTotal > 0
+                          ? { backgroundColor: `${colors.green}20`, borderColor: colors.green }
+                          : { backgroundColor: colors.subCardBg, borderColor: colors.border },
+                        isSelected && daySolveTotal > 0 && { backgroundColor: colors.green },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.dayPickerCountText,
+                          { color: daySolveTotal > 0 ? colors.green : colors.textMuted },
+                          isSelected && daySolveTotal > 0 && { color: '#fff' },
+                        ]}
+                      >
+                        {daySolveTotal > 0 ? `⚡ ${daySolveTotal}` : '0'}
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          </View>
+
+          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.profileScroll}>
+            {selectedDayTracks.map((person) => {
+              const count = person.filteredSubmissions.length;
               const isCurrentOwner = ownerHandle && person.username.toLowerCase() === ownerHandle.toLowerCase();
 
               return (
                 <View key={person.username} style={[styles.personTrackCard, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
                   <View style={styles.personTrackHeader}>
                     {person.avatar ? (
-                      <Image source={{ uri: person.avatar }} style={[styles.personTrackAvatar, { borderColor: colors.primary }]} />
+                      <Image source={{ uri: person.avatar }} style={[styles.personTrackAvatar, { borderColor: colors.cyan }]} />
                     ) : (
-                      <View style={[styles.personTrackAvatarFallback, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
-                        <Text style={{ color: colors.primary, fontSize: 13, fontWeight: '900' }}>
+                      <View style={[styles.personTrackAvatarFallback, { backgroundColor: colors.cyanBg, borderColor: colors.cyan }]}>
+                        <Text style={{ color: colors.cyan, fontSize: 13, fontWeight: '900' }}>
                           {(person.realName || person.username).charAt(0).toUpperCase()}
                         </Text>
                       </View>
@@ -839,7 +896,7 @@ export default function App() {
                       style={[
                         styles.personSolvedCountBadge,
                         count > 0
-                          ? { backgroundColor: '#10b98115', borderColor: '#10b98150' }
+                          ? { backgroundColor: '#10b98120', borderColor: '#10b981' }
                           : { backgroundColor: colors.subCardBg, borderColor: colors.border },
                       ]}
                     >
@@ -849,36 +906,53 @@ export default function App() {
                           { color: count > 0 ? '#10b981' : colors.textMuted },
                         ]}
                       >
-                        {count > 0 ? `⚡ ${count} Solved` : '⏳ Pending'}
+                        {count > 0 ? `⚡ ${count} Solved` : '0 Solves'}
                       </Text>
                     </View>
                   </View>
 
                   {count > 0 ? (
-                    <View style={{ marginTop: 10 }}>
-                      {person.todaySubmissions.map((sub, idx) => (
-                        <TouchableOpacity
-                          key={idx}
-                          style={[styles.personSubRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
-                          activeOpacity={0.75}
-                          onPress={() => openProblemUrl(sub.title)}
-                        >
-                          <View style={styles.recentCheckIcon}>
-                            <Text style={{ color: '#10b981', fontWeight: '900', fontSize: 11 }}>✓</Text>
+                    <View style={{ marginTop: 12 }}>
+                      {person.filteredSubmissions.map((sub, idx) => {
+                        const diffMeta = getDifficultyMeta(sub.difficulty);
+
+                        return (
+                          <View
+                            key={idx}
+                            style={[styles.personSubRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
+                          >
+                            <View style={styles.recentCheckIcon}>
+                              <Text style={{ color: colors.green, fontWeight: '900', fontSize: 11 }}>✓</Text>
+                            </View>
+
+                            <View style={{ flex: 1, paddingRight: 8 }}>
+                              <View style={styles.inlineQuestionRow}>
+                                <View style={[styles.compactDiffBadge, { backgroundColor: `${diffMeta.color}20`, borderColor: `${diffMeta.color}60` }]}>
+                                  <Text style={[styles.compactDiffText, { color: diffMeta.color }]}>{diffMeta.letter}</Text>
+                                </View>
+                                <Text style={[styles.recentTitle, { color: colors.textPrimary }]}>
+                                  {sub.title}
+                                </Text>
+                              </View>
+                              <Text style={[styles.recentDate, { color: colors.textMuted }]}>Solved • {sub.timestamp}</Text>
+                            </View>
+
+                            <TouchableOpacity
+                              style={[styles.openBtnTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
+                              onPress={() => openProblemUrl(sub.title)}
+                              activeOpacity={0.7}
+                            >
+                              <Text style={[styles.openBtnText, { color: colors.cyan }]}>Open ↗</Text>
+                            </TouchableOpacity>
                           </View>
-                          <View style={{ flex: 1, paddingRight: 6 }}>
-                            <Text style={[styles.recentTitle, { color: colors.textPrimary }]}>{sub.title}</Text>
-                            <Text style={[styles.recentDate, { color: colors.textMuted }]}>Completed today • {sub.timestamp}</Text>
-                          </View>
-                          <View style={[styles.openBtnTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                            <Text style={styles.openBtnText}>Open ↗</Text>
-                          </View>
-                        </TouchableOpacity>
-                      ))}
+                        );
+                      })}
                     </View>
                   ) : (
                     <View style={[styles.noSubPersonBox, { backgroundColor: colors.subCardBg }]}>
-                      <Text style={{ color: colors.textMuted, fontSize: 11 }}>No questions solved today yet.</Text>
+                      <Text style={{ color: colors.textMuted, fontSize: 12 }}>
+                        No questions completed on this day.
+                      </Text>
                     </View>
                   )}
                 </View>
@@ -904,11 +978,11 @@ export default function App() {
               onPress={() => setSelectedMember(null)}
               activeOpacity={0.7}
             >
-              <Text style={[styles.navBackBtnText, { color: colors.textPrimary }]}>← Leaderboard</Text>
+              <Text style={[styles.navBackBtnText, { color: colors.textPrimary }]}>← Board</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[styles.externalLinkBtn, { backgroundColor: colors.primaryBg, borderColor: `${colors.primary}50` }]}
+              style={[styles.externalLinkBtn, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}
               onPress={() => openLeetCodeProfile(selectedMember.username)}
               activeOpacity={0.7}
             >
@@ -936,11 +1010,11 @@ export default function App() {
               <View style={styles.pillRow}>
                 {isCurrentOwner && (
                   <View style={[styles.pillBadge, { borderColor: colors.primary, backgroundColor: colors.primaryBg }]}>
-                    <Text style={[styles.pillText, { color: colors.primary }]}>You</Text>
+                    <Text style={[styles.pillText, { color: colors.primary }]}>Primary Account</Text>
                   </View>
                 )}
                 {selectedMember.streak > 0 && (
-                  <View style={[styles.pillBadge, { borderColor: `${colors.primary}50`, backgroundColor: colors.primaryBg }]}>
+                  <View style={[styles.pillBadge, { borderColor: colors.primaryBorder, backgroundColor: colors.primaryBg }]}>
                     <Text style={[styles.pillText, { color: colors.primary }]}>
                       🔥 {selectedMember.streak}d Streak
                     </Text>
@@ -951,56 +1025,52 @@ export default function App() {
 
             <View style={styles.statsGrid}>
               <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                <Text style={[styles.gridVal, { color: colors.textPrimary }]}>
-                  #{selectedMember.ranking ? selectedMember.ranking.toLocaleString() : 'N/A'}
+                <Text style={[styles.gridVal, { color: colors.cyan }]}>
+                  {selectedMember.contestRating > 0 ? selectedMember.contestRating : 'N/A'}
                 </Text>
-                <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Global Rank</Text>
+                <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Contest Rating</Text>
               </View>
               <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                <Text style={[styles.gridVal, { color: colors.textPrimary }]}>
+                <Text style={[styles.gridVal, { color: colors.primary }]}>
                   {selectedMember.totalSolved}
                 </Text>
                 <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Total Solved</Text>
               </View>
               <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                <Text style={[styles.gridVal, { color: '#38bdf8' }]}>
+                <Text style={[styles.gridVal, { color: colors.green }]}>
                   {selectedMember.acceptanceRate > 0 ? `${selectedMember.acceptanceRate}%` : 'N/A'}
                 </Text>
-                <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Acceptance</Text>
+                <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Accuracy</Text>
               </View>
             </View>
 
             <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
               <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Problem Solved Breakdown</Text>
               <View style={styles.difficultyContainer}>
-                <View style={[styles.diffItemBox, { borderColor: '#10b98135', backgroundColor: '#10b98110' }]}>
-                  <Text style={[styles.diffNumber, { color: '#10b981' }]}>{selectedMember.easySolved}</Text>
+                <View style={[styles.diffItemBox, { borderColor: `${colors.green}40`, backgroundColor: `${colors.green}15` }]}>
+                  <Text style={[styles.diffNumber, { color: colors.green }]}>{selectedMember.easySolved}</Text>
                   <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Easy</Text>
                 </View>
 
-                <View style={[styles.diffItemBox, { borderColor: '#f59e0b35', backgroundColor: '#f59e0b10' }]}>
-                  <Text style={[styles.diffNumber, { color: '#f59e0b' }]}>{selectedMember.mediumSolved}</Text>
+                <View style={[styles.diffItemBox, { borderColor: `${colors.yellow}40`, backgroundColor: `${colors.yellow}15` }]}>
+                  <Text style={[styles.diffNumber, { color: colors.yellow }]}>{selectedMember.mediumSolved}</Text>
                   <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Medium</Text>
                 </View>
 
-                <View style={[styles.diffItemBox, { borderColor: '#ef444435', backgroundColor: '#ef444410' }]}>
-                  <Text style={[styles.diffNumber, { color: '#ef4444' }]}>{selectedMember.hardSolved}</Text>
+                <View style={[styles.diffItemBox, { borderColor: `${colors.red}40`, backgroundColor: `${colors.red}15` }]}>
+                  <Text style={[styles.diffNumber, { color: colors.red }]}>{selectedMember.hardSolved}</Text>
                   <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Hard</Text>
                 </View>
               </View>
             </View>
 
+            {/* LeetCode Month-Separated Heatmap */}
             <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
               <View style={styles.heatmapHeaderRow}>
-                <View>
-                  <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Submissions Heatmap</Text>
-                  <Text style={[styles.heatmapSubText, { color: colors.textMuted }]}>
-                    {selectedMember.totalActiveDays} total active days
-                  </Text>
-                </View>
+                <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Submissions Heatmap</Text>
                 {selectedDayInfo && (
-                  <View style={[styles.tooltipBadge, { backgroundColor: colors.subCardBg }]}>
-                    <Text style={styles.tooltipText}>
+                  <View style={[styles.tooltipBadge, { backgroundColor: colors.subCardBg, borderColor: colors.cyan }]}>
+                    <Text style={[styles.tooltipText, { color: colors.cyan }]}>
                       {selectedDayInfo.count} solves on {selectedDayInfo.date}
                     </Text>
                   </View>
@@ -1011,41 +1081,46 @@ export default function App() {
                 ref={heatmapScrollRef}
                 horizontal={true}
                 showsHorizontalScrollIndicator={true}
+                indicatorStyle={isDarkMode ? 'white' : 'black'}
                 onContentSizeChange={() => heatmapScrollRef.current?.scrollToEnd({ animated: false })}
-                contentContainerStyle={{ paddingRight: 24 }}
+                contentContainerStyle={{ paddingRight: 20 }}
                 style={[styles.matrixScroll, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
               >
-                <View style={styles.weeksRowContainer}>
-                  {selectedMember.heatmapWeeks.map((week, wIdx) => (
-                    <View key={week.monthLabel || wIdx} style={styles.weekColumn}>
-                      <View style={styles.monthHeaderSlot}>
-                        {week.monthLabel ? (
-                          <Text style={[styles.monthHeaderText, { color: colors.textSecondary }]}>{week.monthLabel}</Text>
-                        ) : null}
-                      </View>
+                <View style={styles.monthsContainerRow}>
+                  {(selectedMember.heatmapMonthGroups || []).map((monthGroup, mIdx) => (
+                    <View key={mIdx} style={styles.monthBlock}>
+                      <Text style={[styles.monthBlockLabel, { color: colors.textMuted }]}>
+                        {monthGroup.monthName}
+                      </Text>
 
-                      {week.days.map((day, dIdx) => (
-                        <TouchableOpacity
-                          key={day?.date || dIdx}
-                          activeOpacity={day ? 0.7 : 1}
-                          onPress={() => day && setSelectedDayInfo(day)}
-                          style={[
-                            styles.leetCodeSquare,
-                            {
-                              backgroundColor: day
-                                ? getLeetCodeMatrixSquareColor(day.level)
-                                : 'transparent',
-                              borderColor:
-                                selectedDayInfo?.date === day?.date
-                                  ? '#38bdf8'
-                                  : day?.isToday
-                                  ? colors.primary
-                                  : colors.border,
-                              borderWidth: day?.isToday ? 1 : 0.5,
-                            },
-                          ]}
-                        />
-                      ))}
+                      <View style={styles.monthWeeksRow}>
+                        {monthGroup.weeks.map((week, wIdx) => (
+                          <View key={wIdx} style={styles.weekColumn}>
+                            {week.days.map((day, dIdx) => (
+                              <TouchableOpacity
+                                key={day?.date || dIdx}
+                                activeOpacity={day ? 0.7 : 1}
+                                onPress={() => day && setSelectedDayInfo(day)}
+                                style={[
+                                  styles.leetCodeSquare,
+                                  {
+                                    backgroundColor: day
+                                      ? getLeetCodeMatrixSquareColor(day.level)
+                                      : 'transparent',
+                                    borderColor:
+                                      selectedDayInfo?.date === day?.date
+                                        ? colors.cyan
+                                        : day?.isToday
+                                        ? colors.primary
+                                        : day ? colors.border : 'transparent',
+                                    borderWidth: day?.isToday ? 1.5 : day ? 0.5 : 0,
+                                  },
+                                ]}
+                              />
+                            ))}
+                          </View>
+                        ))}
+                      </View>
                     </View>
                   ))}
                 </View>
@@ -1053,21 +1128,21 @@ export default function App() {
 
               <View style={styles.heatmapLegend}>
                 <Text style={[styles.legendText, { color: colors.textMuted }]}>Less</Text>
-                <View style={[styles.legendBox, { backgroundColor: isDarkMode ? '#161b22' : '#e2e8f0', borderColor: colors.border, borderWidth: 1 }]} />
-                <View style={[styles.legendBox, { backgroundColor: isDarkMode ? '#0e4429' : '#86efac' }]} />
-                <View style={[styles.legendBox, { backgroundColor: '#26a641' }]} />
-                <View style={[styles.legendBox, { backgroundColor: '#00b8a3' }]} />
+                <View style={[styles.legendBox, { backgroundColor: isDarkMode ? '#1e293b' : '#e2e8f0', borderColor: colors.border, borderWidth: 1 }]} />
+                <View style={[styles.legendBox, { backgroundColor: isDarkMode ? '#064e3b' : '#a7f3d0' }]} />
+                <View style={[styles.legendBox, { backgroundColor: '#10b981' }]} />
+                <View style={[styles.legendBox, { backgroundColor: '#00f2fe' }]} />
                 <Text style={[styles.legendText, { color: colors.textMuted }]}>More</Text>
               </View>
             </View>
 
             <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>DSA Strengths</Text>
+              <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>DSA Focus Areas</Text>
               <View style={styles.topicGrid}>
                 {selectedMember.topTopics.map((topic, idx) => (
                   <View key={idx} style={[styles.topicBadge, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
                     <Text style={[styles.topicName, { color: colors.textPrimary }]}>{topic.name}</Text>
-                    <Text style={[styles.topicCount, { color: colors.textMuted }]}>{topic.solved} solved</Text>
+                    <Text style={[styles.topicCount, { color: colors.cyan }]}>{topic.solved} solved</Text>
                   </View>
                 ))}
               </View>
@@ -1077,32 +1152,34 @@ export default function App() {
               <View style={styles.pastHeaderRow}>
                 <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Recent Submissions</Text>
                 <Text style={[styles.pastCountText, { color: colors.textMuted }]}>
-                  {selectedMember.recentSubmissions.length} recent
+                  {selectedMember.recentSubmissions.length} public solves
                 </Text>
               </View>
 
               {selectedMember.recentSubmissions.length > 0 ? (
                 selectedMember.recentSubmissions.map((s, idx) => (
-                  <TouchableOpacity
+                  <View
                     key={idx}
                     style={[styles.recentRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
-                    activeOpacity={0.75}
-                    onPress={() => openProblemUrl(s.title)}
                   >
                     <View style={styles.recentCheckIcon}>
-                      <Text style={{ color: '#10b981', fontWeight: '800', fontSize: 13 }}>✓</Text>
+                      <Text style={{ color: colors.green, fontWeight: '800', fontSize: 13 }}>✓</Text>
                     </View>
                     <View style={{ flex: 1, paddingRight: 6 }}>
                       <Text style={[styles.recentTitle, { color: colors.textPrimary }]}>{s.title}</Text>
                       <Text style={[styles.recentDate, { color: colors.textMuted }]}>Solved on {s.timestamp}</Text>
                     </View>
-                    <View style={[styles.openBtnTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                      <Text style={styles.openBtnText}>Open ↗</Text>
-                    </View>
-                  </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.openBtnTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
+                      onPress={() => openProblemUrl(s.title)}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={[styles.openBtnText, { color: colors.cyan }]}>Open ↗</Text>
+                    </TouchableOpacity>
+                  </View>
                 ))
               ) : (
-                <View style={[styles.noSubBox, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
+                <View style={[styles.noSubBox, { backgroundColor: colors.subCardBg }]}>
                   <Text style={{ color: colors.textMuted, fontSize: 13 }}>No recent public submissions found.</Text>
                 </View>
               )}
@@ -1118,6 +1195,7 @@ export default function App() {
       <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]}>
         <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
 
+        {/* Top Navbar */}
         <View style={styles.header}>
           <TouchableOpacity
             style={[styles.drawerBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
@@ -1129,10 +1207,7 @@ export default function App() {
 
           <View style={styles.headerRight}>
             <TouchableOpacity
-              style={[
-                styles.themeToggleBtn,
-                { backgroundColor: colors.cardBg, borderColor: colors.border },
-              ]}
+              style={[styles.themeToggleBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
               onPress={toggleTheme}
               activeOpacity={0.7}
             >
@@ -1151,19 +1226,13 @@ export default function App() {
                 ⏰ {reminderConfig.enabled ? formatReminderTime(reminderConfig.hour, reminderConfig.minute) : 'Off'}
               </Text>
             </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.testBtn, { backgroundColor: colors.cardBg, borderColor: colors.borderLight }]}
-              onPress={testSolveAlert}
-            >
-              <Text style={[styles.testBtnText, { color: colors.textSecondary }]}>🔔</Text>
-            </TouchableOpacity>
           </View>
         </View>
 
+        {/* Daily POTD Glowing Banner */}
         {dailyProblem && (
           <TouchableOpacity
-            style={[styles.potdBanner, { backgroundColor: colors.cardBg, borderColor: `${colors.primary}30` }]}
+            style={[styles.potdBanner, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}
             activeOpacity={0.88}
             onPress={() => openProblemUrl(dailyProblem.link)}
           >
@@ -1175,10 +1244,10 @@ export default function App() {
               <View
                 style={[
                   styles.potdDiffBadge,
-                  { backgroundColor: `${getDifficultyColor(dailyProblem.difficulty)}20`, borderColor: `${getDifficultyColor(dailyProblem.difficulty)}50` },
+                  { backgroundColor: `${getDifficultyMeta(dailyProblem.difficulty).color}20`, borderColor: `${getDifficultyMeta(dailyProblem.difficulty).color}60` },
                 ]}
               >
-                <Text style={[styles.potdDiffText, { color: getDifficultyColor(dailyProblem.difficulty) }]}>
+                <Text style={[styles.potdDiffText, { color: getDifficultyMeta(dailyProblem.difficulty).color }]}>
                   {dailyProblem.difficulty}
                 </Text>
               </View>
@@ -1194,11 +1263,39 @@ export default function App() {
                   </View>
                 ))}
               </View>
-              <Text style={styles.potdSolveText}>Solve Now ↗</Text>
+              <Text style={[styles.potdSolveText, { color: colors.cyan }]}>Solve Now ↗</Text>
             </View>
           </TouchableOpacity>
         )}
 
+        {/* Dedicated Responsive Live Activity Banner */}
+        <TouchableOpacity
+          style={[styles.liveActivityBanner, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}
+          onPress={() => {
+            setSelectedDayIndex(0);
+            setIsTodayTrackScreenOpen(true);
+          }}
+          activeOpacity={0.8}
+        >
+          <View style={styles.liveActivityLeft}>
+            <View style={[styles.liveActivityIconRing, { backgroundColor: colors.primaryBg }]}>
+              <Text style={{ fontSize: 16 }}>🎯</Text>
+            </View>
+            <View>
+              <Text style={[styles.liveActivityTitle, { color: colors.textPrimary }]}>Live Team Activity</Text>
+              <Text style={[styles.liveActivitySub, { color: colors.textMuted }]}>Today & past 7 days records</Text>
+            </View>
+          </View>
+
+          <View style={[styles.liveActivityCountBadge, { backgroundColor: colors.primary }]}>
+            <Text style={styles.liveActivityCountText}>
+              {totalSolvesTodayCount} Solved Today
+            </Text>
+            <Text style={{ color: '#fff', fontSize: 11, fontWeight: '900' }}>↗</Text>
+          </View>
+        </TouchableOpacity>
+
+        {/* Search Field */}
         {members.length > 0 && (
           <View style={styles.searchRow}>
             <TextInput
@@ -1212,6 +1309,7 @@ export default function App() {
           </View>
         )}
 
+        {/* Sorting Tabs Full Screen Width */}
         <View style={styles.filterTabs}>
           <Text style={[styles.sortLabel, { color: colors.textMuted }]}>SORT</Text>
           <TouchableOpacity
@@ -1232,27 +1330,15 @@ export default function App() {
           >
             <Text style={[styles.tabText, { color: colors.textSecondary }, sortBy === 'acceptance' && styles.activeTabText]}>Accuracy</Text>
           </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.todayTrackBtn, { backgroundColor: colors.primary }]}
-            onPress={() => setIsTodayTrackScreenOpen(true)}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.todayTrackBtnText}>🎯 Today's Track</Text>
-            {totalSolvesTodayCount > 0 && (
-              <View style={[styles.todayTrackBadge, { backgroundColor: colors.bg }]}>
-                <Text style={[styles.todayTrackBadgeText, { color: colors.primary }]}>{totalSolvesTodayCount}</Text>
-              </View>
-            )}
-          </TouchableOpacity>
         </View>
 
+        {/* Team Leaderboard Cards */}
         <FlatList
           data={filteredMembers}
           keyExtractor={(item) => item.username}
           refreshing={refreshing}
           onRefresh={() => refreshTeam(members.map((m) => m.username), true, true)}
-          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
+          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 30 }}
           ListEmptyComponent={
             <View style={styles.emptyState}>
               <Text style={styles.emptyEmoji}>⚡</Text>
@@ -1279,7 +1365,7 @@ export default function App() {
                 style={[
                   styles.card,
                   { backgroundColor: colors.cardBg, borderColor: colors.border },
-                  index === 0 && { borderColor: '#eab30850' },
+                  index === 0 && { borderColor: '#ff990080' },
                 ]}
               >
                 <View style={styles.cardHead}>
@@ -1289,7 +1375,7 @@ export default function App() {
                     </View>
 
                     {item.avatar ? (
-                      <Image source={{ uri: item.avatar }} style={styles.cardAvatarImage} />
+                      <Image source={{ uri: item.avatar }} style={[styles.cardAvatarImage, { borderColor: colors.cyan }]} />
                     ) : (
                       <View style={[styles.cardAvatarFallback, { backgroundColor: colors.subCardBg, borderColor: colors.borderLight }]}>
                         <Text style={[styles.cardAvatarText, { color: colors.textSecondary }]}>
@@ -1309,7 +1395,7 @@ export default function App() {
                         )}
 
                         {item.streak > 0 && (
-                          <View style={[styles.streakBadge, { backgroundColor: colors.primaryBg, borderColor: `${colors.primary}50` }]}>
+                          <View style={[styles.streakBadge, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}>
                             <Text style={[styles.streakText, { color: colors.primary }]}>🔥 {item.streak}d</Text>
                           </View>
                         )}
@@ -1325,9 +1411,9 @@ export default function App() {
                 </View>
 
                 <View style={[styles.bar, { backgroundColor: colors.subCardBg }]}>
-                  <View style={[styles.seg, { width: `${easyP}%`, backgroundColor: '#10b981' }]} />
-                  <View style={[styles.seg, { width: `${medP}%`, backgroundColor: '#f59e0b' }]} />
-                  <View style={[styles.seg, { width: `${hardP}%`, backgroundColor: '#ef4444' }]} />
+                  <View style={[styles.seg, { width: `${easyP}%`, backgroundColor: colors.green }]} />
+                  <View style={[styles.seg, { width: `${medP}%`, backgroundColor: colors.yellow }]} />
+                  <View style={[styles.seg, { width: `${hardP}%`, backgroundColor: colors.red }]} />
                 </View>
 
                 <View style={styles.statsFlex}>
@@ -1337,16 +1423,16 @@ export default function App() {
                   </View>
 
                   <View style={styles.badges}>
-                    <View style={[styles.badgeItem, { backgroundColor: '#10b98115', borderColor: '#10b98135' }]}>
-                      <Text style={[styles.badgeVal, { color: '#10b981' }]}>{item.easySolved}</Text>
+                    <View style={[styles.badgeItem, { backgroundColor: `${colors.green}18`, borderColor: `${colors.green}40` }]}>
+                      <Text style={[styles.badgeVal, { color: colors.green }]}>{item.easySolved}</Text>
                       <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Easy</Text>
                     </View>
-                    <View style={[styles.badgeItem, { backgroundColor: '#f59e0b15', borderColor: '#f59e0b35' }]}>
-                      <Text style={[styles.badgeVal, { color: '#f59e0b' }]}>{item.mediumSolved}</Text>
+                    <View style={[styles.badgeItem, { backgroundColor: `${colors.yellow}18`, borderColor: `${colors.yellow}40` }]}>
+                      <Text style={[styles.badgeVal, { color: colors.yellow }]}>{item.mediumSolved}</Text>
                       <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Med</Text>
                     </View>
-                    <View style={[styles.badgeItem, { backgroundColor: '#ef444415', borderColor: '#ef444435' }]}>
-                      <Text style={[styles.badgeVal, { color: '#ef4444' }]}>{item.hardSolved}</Text>
+                    <View style={[styles.badgeItem, { backgroundColor: `${colors.red}18`, borderColor: `${colors.red}40` }]}>
+                      <Text style={[styles.badgeVal, { color: colors.red }]}>{item.hardSolved}</Text>
                       <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Hard</Text>
                     </View>
 
@@ -1354,14 +1440,14 @@ export default function App() {
                       style={[
                         styles.badgeItem,
                         item.solvedDailyToday
-                          ? { backgroundColor: '#10b98115', borderColor: '#10b98150' }
+                          ? { backgroundColor: `${colors.green}20`, borderColor: `${colors.green}60` }
                           : { backgroundColor: colors.subCardBg, borderColor: colors.border },
                       ]}
                     >
                       <Text
                         style={[
                           styles.badgeVal,
-                          { color: item.solvedDailyToday ? '#10b981' : colors.textMuted },
+                          { color: item.solvedDailyToday ? colors.green : colors.textMuted },
                         ]}
                       >
                         {item.solvedDailyToday ? '✓' : '⏳'}
@@ -1369,7 +1455,7 @@ export default function App() {
                       <Text
                         style={[
                           styles.badgeDiff,
-                          { color: item.solvedDailyToday ? '#10b981' : colors.textMuted, fontWeight: '800' },
+                          { color: item.solvedDailyToday ? colors.green : colors.textMuted, fontWeight: '800' },
                         ]}
                       >
                         POTD
@@ -1392,13 +1478,12 @@ export default function App() {
           <View style={styles.modalShade}>
             <View style={[styles.sheet, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
               <View style={styles.modalHead}>
-                <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>Menu & Options</Text>
+                <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>Settings & Team</Text>
                 <TouchableOpacity onPress={() => setDrawerOpen(false)} style={[styles.sheetClose, { backgroundColor: colors.subCardBg }]}>
                   <Text style={[styles.sheetCloseText, { color: colors.textSecondary }]}>✕</Text>
                 </TouchableOpacity>
               </View>
 
-              {/* View Profile Option */}
               {ownerStats && (
                 <TouchableOpacity
                   style={[styles.drawerProfileBtn, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
@@ -1429,7 +1514,6 @@ export default function App() {
                 </TouchableOpacity>
               )}
 
-              {/* Add Teammate Option */}
               <Text style={[styles.sheetSub, { color: colors.textPrimary, marginTop: 16, marginBottom: 8 }]}>
                 Add Teammate
               </Text>
@@ -1451,34 +1535,6 @@ export default function App() {
                 </TouchableOpacity>
               </View>
 
-              {/* Push Token Diagnostic Row */}
-              {pushToken && (
-                <TouchableOpacity
-                  style={[styles.pushTokenBox, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
-                  onPress={() => Alert.alert('Your Expo Push Token', pushToken)}
-                >
-                  <Text style={[styles.pushTokenLabel, { color: colors.textMuted }]}>Device Push Token (Tap to View)</Text>
-                  <Text style={[styles.pushTokenVal, { color: colors.textSecondary }]} numberOfLines={1}>
-                    {pushToken}
-                  </Text>
-                </TouchableOpacity>
-              )}
-
-              {/* Force Manual Sync Button */}
-              <TouchableOpacity
-                style={[styles.forceSyncBtn, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}
-                onPress={async () => {
-                  const token = pushToken || (await getDevicePushToken());
-                  if (token) setPushToken(token);
-                  const list = members.map((m) => m.username);
-                  await syncCloudTracking(list, token);
-                  Alert.alert('Cloud Sync Triggered', 'Completed manual sync routine.');
-                }}
-              >
-                <Text style={[styles.forceSyncBtnText, { color: colors.primary }]}>⚡ Force Cloud Sync Now</Text>
-              </TouchableOpacity>
-
-              {/* Sign Out Button */}
               <TouchableOpacity
                 style={styles.signOutBtn}
                 onPress={handleSignOut}
@@ -1605,198 +1661,311 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   splashFullOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', zIndex: 999 },
   splashContentCenter: { alignItems: 'center', justifyContent: 'center' },
-  splashGlowHalo: { position: 'absolute', width: 140, height: 140, borderRadius: 70, backgroundColor: '#f9731618' },
-  splashTitle: { fontSize: 48, fontWeight: '900', color: '#f97316', letterSpacing: 4 },
-  splashSubBadge: { marginTop: 10, paddingHorizontal: 12, paddingVertical: 4, borderRadius: 20, backgroundColor: '#f9731615', borderWidth: 1, borderColor: '#f9731640' },
-  splashSubBadgeText: { color: '#f97316', fontSize: 10, fontWeight: '900', letterSpacing: 1.5 },
+  splashGlowHalo: { position: 'absolute', width: 200, height: 200, borderRadius: 100, backgroundColor: '#ff990020' },
+  splashBadgeIcon: { width: 70, height: 70, borderRadius: 22, backgroundColor: '#ff990020', borderWidth: 1.5, borderColor: '#ff990060', alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
+  splashTitle: { fontSize: 44, fontWeight: '900', color: '#ff9900', letterSpacing: 5 },
+  splashSubBadge: { marginTop: 12, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 20, backgroundColor: '#ff990015', borderWidth: 1, borderColor: '#ff990040' },
+  splashSubBadgeText: { color: '#ff9900', fontSize: 11, fontWeight: '900', letterSpacing: 1.5 },
 
-  header: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  drawerBtn: { paddingVertical: 7, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1 },
+  header: { paddingHorizontal: 16, paddingTop: 14, paddingBottom: 12, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  drawerBtn: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 12, borderWidth: 1 },
   drawerBtnIcon: { fontSize: 16, fontWeight: '900' },
-  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  themeToggleBtn: { borderWidth: 1, paddingVertical: 6, paddingHorizontal: 9, borderRadius: 10 },
-  themeToggleBtnText: { fontSize: 13, fontWeight: '700' },
-  reminderHeaderBtn: { borderWidth: 1, paddingVertical: 6, paddingHorizontal: 9, borderRadius: 10 },
-  reminderHeaderBtnText: { fontSize: 11, fontWeight: '700' },
-  testBtn: { paddingVertical: 6, paddingHorizontal: 9, borderRadius: 10, borderWidth: 1 },
-  testBtnText: { fontSize: 12, fontWeight: '700' },
-  todayCountTag: { borderWidth: 1, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 10 },
-  todayCountTagText: { fontSize: 11, fontWeight: '800' },
+  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  themeToggleBtn: { borderWidth: 1, paddingVertical: 8, paddingHorizontal: 11, borderRadius: 12 },
+  themeToggleBtnText: { fontSize: 14, fontWeight: '700' },
+  reminderHeaderBtn: { borderWidth: 1, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 12 },
+  reminderHeaderBtnText: { fontSize: 12, fontWeight: '800' },
+  todayCountTag: { borderWidth: 1, paddingVertical: 7, paddingHorizontal: 12, borderRadius: 12 },
+  todayCountTagText: { fontSize: 12, fontWeight: '800' },
 
-  potdBanner: { marginHorizontal: 16, marginBottom: 12, padding: 14, borderRadius: 16, borderWidth: 1 },
-  potdHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
-  potdTagWrapper: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  potdSparkle: { fontSize: 11 },
-  potdTag: { fontSize: 10, fontWeight: '900', letterSpacing: 0.5 },
-  potdDiffBadge: { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 6, borderWidth: 1 },
-  potdDiffText: { fontSize: 10, fontWeight: '800' },
-  potdTitle: { fontSize: 15, fontWeight: '800', marginBottom: 8 },
+  potdBanner: { marginHorizontal: 16, marginBottom: 12, padding: 16, borderRadius: 18, borderWidth: 1 },
+  potdHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
+  potdTagWrapper: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  potdSparkle: { fontSize: 12 },
+  potdTag: { fontSize: 11, fontWeight: '900', letterSpacing: 0.6 },
+  potdDiffBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8, borderWidth: 1 },
+  potdDiffText: { fontSize: 11, fontWeight: '800' },
+  potdTitle: { fontSize: 16, fontWeight: '900', marginBottom: 10 },
   potdFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  potdTopicsRow: { flexDirection: 'row', gap: 5 },
-  potdTopicItem: { paddingHorizontal: 6, paddingVertical: 2, borderRadius: 5, borderWidth: 1 },
-  potdTopicText: { fontSize: 10, fontWeight: '600' },
-  potdSolveText: { color: '#38bdf8', fontSize: 11, fontWeight: '700' },
-  searchRow: { paddingHorizontal: 16, marginBottom: 10 },
-  searchInput: { borderRadius: 12, paddingHorizontal: 14, paddingVertical: 8, fontSize: 12, borderWidth: 1 },
+  potdTopicsRow: { flexDirection: 'row', gap: 6 },
+  potdTopicItem: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, borderWidth: 1 },
+  potdTopicText: { fontSize: 10, fontWeight: '700' },
+  potdSolveText: { fontSize: 12, fontWeight: '800' },
 
-  filterTabs: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, marginBottom: 12, gap: 5 },
-  sortLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
-  tab: { paddingVertical: 5, paddingHorizontal: 9, borderRadius: 8, borderWidth: 1 },
-  tabText: { fontSize: 11, fontWeight: '700' },
-  activeTabText: { color: '#fff' },
-  todayTrackBtn: { flexDirection: 'row', alignItems: 'center', paddingVertical: 5, paddingHorizontal: 9, borderRadius: 8, gap: 4, marginLeft: 'auto' },
-  todayTrackBtnText: { color: '#fff', fontSize: 11, fontWeight: '800' },
-  todayTrackBadge: { paddingHorizontal: 5, paddingVertical: 1, borderRadius: 10 },
-  todayTrackBadgeText: { fontSize: 10, fontWeight: '900' },
+  liveActivityBanner: {
+    marginHorizontal: 16,
+    marginBottom: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 16,
+    borderWidth: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  liveActivityLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+    paddingRight: 8,
+  },
+  liveActivityIconRing: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  liveActivityTitle: {
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  liveActivitySub: {
+    fontSize: 11,
+    marginTop: 1,
+    fontWeight: '600',
+  },
+  liveActivityCountBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+  },
+  liveActivityCountText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '900',
+  },
 
-  card: { borderRadius: 16, padding: 14, marginBottom: 10, borderWidth: 1 },
-  cardHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
-  rankInfo: { flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1 },
-  podiumBadge: { width: 32, height: 32, borderRadius: 10, alignItems: 'center', justifyContent: 'center', borderWidth: 1 },
+  dayPickerScroll: {
+    paddingHorizontal: 16,
+    gap: 8,
+  },
+  dayPickerCard: {
+    width: 90,
+    paddingVertical: 10,
+    paddingHorizontal: 6,
+    borderRadius: 14,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dayPickerLabel: {
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  dayPickerSubLabel: {
+    fontSize: 10,
+    marginTop: 2,
+    fontWeight: '600',
+  },
+  dayPickerCountBadge: {
+    marginTop: 6,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+  },
+  dayPickerCountText: {
+    fontSize: 10,
+    fontWeight: '900',
+  },
+
+  searchRow: { paddingHorizontal: 16, marginBottom: 12 },
+  searchInput: { borderRadius: 14, paddingHorizontal: 16, paddingVertical: 10, fontSize: 13, borderWidth: 1 },
+
+  filterTabs: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, marginBottom: 14, gap: 8 },
+  sortLabel: { fontSize: 11, fontWeight: '900', letterSpacing: 0.5 },
+  tab: { flex: 1, paddingVertical: 8, borderRadius: 10, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  tabText: { fontSize: 12, fontWeight: '700' },
+  activeTabText: { color: '#fff', fontWeight: '900' },
+
+  card: { borderRadius: 18, padding: 16, marginBottom: 12, borderWidth: 1 },
+  cardHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  rankInfo: { flexDirection: 'row', alignItems: 'center', gap: 12, flex: 1 },
+  podiumBadge: { width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center', borderWidth: 1 },
   podiumText: { fontSize: 13, fontWeight: '900' },
-  cardAvatarImage: { width: 36, height: 36, borderRadius: 18, borderWidth: 1.5, borderColor: '#38bdf8' },
-  cardAvatarFallback: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center', borderWidth: 1 },
-  cardAvatarText: { fontSize: 13, fontWeight: '800' },
-  cardName: { fontSize: 15, fontWeight: '800' },
-  cardHandle: { fontSize: 11, marginTop: 1 },
-  ownerBadge: { borderWidth: 1, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 4 },
-  ownerBadgeText: { fontSize: 9, fontWeight: '800' },
-  ownerSmallBadge: { borderWidth: 1, paddingHorizontal: 5, paddingVertical: 1, borderRadius: 4 },
-  ownerSmallBadgeText: { fontSize: 8, fontWeight: '800' },
-  streakBadge: { borderWidth: 1, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 6 },
-  streakText: { fontSize: 9, fontWeight: '800' },
-  delText: { fontSize: 14, padding: 4 },
-  bar: { flexDirection: 'row', height: 4, borderRadius: 2, overflow: 'hidden', marginBottom: 12 },
+  cardAvatarImage: { width: 40, height: 40, borderRadius: 20, borderWidth: 1.5 },
+  cardAvatarFallback: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', borderWidth: 1 },
+  cardAvatarText: { fontSize: 14, fontWeight: '900' },
+  cardName: { fontSize: 16, fontWeight: '900' },
+  cardHandle: { fontSize: 12, marginTop: 1 },
+  ownerBadge: { borderWidth: 1, paddingHorizontal: 6, paddingVertical: 1.5, borderRadius: 5 },
+  ownerBadgeText: { fontSize: 9, fontWeight: '900' },
+  ownerSmallBadge: { borderWidth: 1, paddingHorizontal: 6, paddingVertical: 1.5, borderRadius: 5 },
+  ownerSmallBadgeText: { fontSize: 9, fontWeight: '900' },
+  streakBadge: { borderWidth: 1, paddingHorizontal: 7, paddingVertical: 2, borderRadius: 6 },
+  streakText: { fontSize: 10, fontWeight: '800' },
+  delText: { fontSize: 15, padding: 4 },
+  bar: { flexDirection: 'row', height: 5, borderRadius: 3, overflow: 'hidden', marginBottom: 14 },
   seg: { height: '100%' },
   statsFlex: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   totalBox: { alignItems: 'flex-start' },
-  totalText: { fontSize: 20, fontWeight: '900' },
-  subLabel: { fontSize: 9, textTransform: 'uppercase', fontWeight: '700' },
-  badges: { flexDirection: 'row', gap: 5 },
-  badgeItem: { paddingVertical: 4, paddingHorizontal: 8, borderRadius: 8, alignItems: 'center', minWidth: 42, borderWidth: 1 },
-  badgeVal: { fontSize: 12, fontWeight: '800' },
-  badgeDiff: { fontSize: 9, marginTop: 1, fontWeight: '600' },
-  emptyState: { alignItems: 'center', marginTop: 40, paddingHorizontal: 20 },
-  emptyEmoji: { fontSize: 32, marginBottom: 8 },
-  emptyText: { fontSize: 13, textAlign: 'center', lineHeight: 18 },
+  totalText: { fontSize: 22, fontWeight: '900' },
+  subLabel: { fontSize: 9, textTransform: 'uppercase', fontWeight: '800', letterSpacing: 0.5 },
+  badges: { flexDirection: 'row', gap: 6 },
+  badgeItem: { paddingVertical: 5, paddingHorizontal: 9, borderRadius: 8, alignItems: 'center', minWidth: 44, borderWidth: 1 },
+  badgeVal: { fontSize: 13, fontWeight: '900' },
+  badgeDiff: { fontSize: 9, marginTop: 1, fontWeight: '700' },
+  emptyState: { alignItems: 'center', marginTop: 44, paddingHorizontal: 20 },
+  emptyEmoji: { fontSize: 36, marginBottom: 10 },
+  emptyText: { fontSize: 14, textAlign: 'center', lineHeight: 20 },
 
-  onboardingCard: { padding: 24, borderRadius: 20, borderWidth: 1, alignItems: 'center' },
-  onboardingBadge: { fontSize: 11, fontWeight: '900', letterSpacing: 1, marginBottom: 6 },
+  onboardingCard: { padding: 28, borderRadius: 24, borderWidth: 1, alignItems: 'center' },
+  onboardingIconRing: { width: 68, height: 68, borderRadius: 34, borderWidth: 1.5, alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
+  onboardingBadge: { fontSize: 11, fontWeight: '900', letterSpacing: 1.2, marginBottom: 6 },
   onboardingTitle: { fontSize: 24, fontWeight: '900', textAlign: 'center', marginBottom: 8 },
-  onboardingSub: { fontSize: 13, textAlign: 'center', lineHeight: 18, marginBottom: 20 },
-  onboardingInput: { width: '100%', borderRadius: 12, paddingHorizontal: 16, paddingVertical: 12, fontSize: 15, borderWidth: 1, marginBottom: 16 },
-  onboardingBtn: { width: '100%', borderRadius: 12, paddingVertical: 14, alignItems: 'center' },
+  onboardingSub: { fontSize: 13, textAlign: 'center', lineHeight: 19, marginBottom: 22 },
+  onboardingInput: { width: '100%', borderRadius: 14, paddingHorizontal: 16, paddingVertical: 14, fontSize: 15, borderWidth: 1, marginBottom: 16 },
+  onboardingBtn: { width: '100%', borderRadius: 14, paddingVertical: 15, alignItems: 'center' },
   onboardingBtnText: { color: '#fff', fontSize: 15, fontWeight: '900' },
 
-  drawerProfileBtn: { flexDirection: 'row', alignItems: 'center', padding: 14, borderRadius: 14, borderWidth: 1, gap: 10, marginBottom: 8 },
-  drawerAvatar: { width: 40, height: 40, borderRadius: 20 },
-  drawerAvatarFallback: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
-  drawerProfileName: { fontSize: 15, fontWeight: '800' },
-  drawerProfileHandle: { fontSize: 11, marginTop: 1 },
+  drawerProfileBtn: { flexDirection: 'row', alignItems: 'center', padding: 14, borderRadius: 14, borderWidth: 1, gap: 12, marginBottom: 10 },
+  drawerAvatar: { width: 44, height: 44, borderRadius: 22 },
+  drawerAvatarFallback: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center' },
+  drawerProfileName: { fontSize: 16, fontWeight: '900' },
+  drawerProfileHandle: { fontSize: 12, marginTop: 1 },
   drawerAddRow: { flexDirection: 'row', gap: 8 },
-  drawerInput: { flex: 1, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10, fontSize: 13, borderWidth: 1 },
-  drawerAddBtn: { borderRadius: 12, paddingHorizontal: 18, justifyContent: 'center', alignItems: 'center' },
-  drawerAddBtnText: { color: '#fff', fontWeight: '800', fontSize: 13 },
-  pushTokenBox: { marginTop: 14, padding: 10, borderRadius: 10, borderWidth: 1 },
-  pushTokenLabel: { fontSize: 10, fontWeight: '700', marginBottom: 2 },
-  pushTokenVal: { fontSize: 11, fontWeight: '600' },
-  forceSyncBtn: { marginTop: 10, paddingVertical: 10, borderRadius: 10, borderWidth: 1, alignItems: 'center' },
-  forceSyncBtnText: { fontSize: 12, fontWeight: '800' },
-  signOutBtn: { marginTop: 18, paddingVertical: 12, borderRadius: 12, alignItems: 'center', backgroundColor: '#ef444415', borderWidth: 1, borderColor: '#ef444450' },
-  signOutBtnText: { color: '#ef4444', fontSize: 13, fontWeight: '800' },
+  drawerInput: { flex: 1, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, fontSize: 13, borderWidth: 1 },
+  drawerAddBtn: { borderRadius: 12, paddingHorizontal: 20, justifyContent: 'center', alignItems: 'center' },
+  drawerAddBtnText: { color: '#fff', fontWeight: '900', fontSize: 14 },
+  signOutBtn: { marginTop: 18, paddingVertical: 14, borderRadius: 14, alignItems: 'center', backgroundColor: '#f43f5e15', borderWidth: 1, borderColor: '#f43f5e50' },
+  signOutBtnText: { color: '#f43f5e', fontSize: 14, fontWeight: '900' },
 
-  profileNavBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1 },
+  profileNavBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1 },
   navBackBtn: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1 },
   navBackBtnText: { fontSize: 13, fontWeight: '800' },
-  externalLinkBtn: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1 },
-  externalLinkBtnText: { fontSize: 12, fontWeight: '800' },
-  profileScroll: { padding: 16, paddingBottom: 40 },
-  profileCard: { padding: 20, borderRadius: 20, alignItems: 'center', marginBottom: 14, borderWidth: 1 },
-  profileAvatarImage: { width: 68, height: 68, borderRadius: 34, borderWidth: 2, marginBottom: 10 },
-  profileAvatar: { width: 68, height: 68, borderRadius: 34, borderWidth: 2, alignItems: 'center', justifyContent: 'center', marginBottom: 10 },
-  profileAvatarText: { fontSize: 26, fontWeight: '900' },
-  profileRealName: { fontSize: 20, fontWeight: '900', textAlign: 'center' },
+  externalLinkBtn: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1 },
+  externalLinkBtnText: { fontSize: 12, fontWeight: '900' },
+  profileScroll: { padding: 16, paddingBottom: 44 },
+  profileCard: { padding: 22, borderRadius: 22, alignItems: 'center', marginBottom: 16, borderWidth: 1 },
+  profileAvatarImage: { width: 74, height: 74, borderRadius: 37, borderWidth: 2, marginBottom: 12 },
+  profileAvatar: { width: 74, height: 74, borderRadius: 37, borderWidth: 2, alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
+  profileAvatarText: { fontSize: 28, fontWeight: '900' },
+  profileRealName: { fontSize: 22, fontWeight: '900', textAlign: 'center' },
   profileHandle: { fontSize: 13, marginTop: 2, fontWeight: '600' },
-  pillRow: { flexDirection: 'row', gap: 8, marginTop: 12, flexWrap: 'wrap', justifyContent: 'center' },
-  pillBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8, borderWidth: 1 },
-  pillText: { fontSize: 11, fontWeight: '700' },
-  profileSection: { padding: 16, borderRadius: 18, marginBottom: 14, borderWidth: 1 },
-  sectionTitle: { fontSize: 12, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.5 },
+  pillRow: { flexDirection: 'row', gap: 8, marginTop: 14, flexWrap: 'wrap', justifyContent: 'center' },
+  pillBadge: { paddingHorizontal: 12, paddingVertical: 5, borderRadius: 8, borderWidth: 1 },
+  pillText: { fontSize: 11, fontWeight: '800' },
+  profileSection: { padding: 18, borderRadius: 20, marginBottom: 16, borderWidth: 1 },
+  sectionTitle: { fontSize: 12, fontWeight: '900', textTransform: 'uppercase', letterSpacing: 0.6 },
 
-  todayTrackHero: { padding: 16, borderRadius: 16, marginBottom: 14, borderWidth: 1 },
-  todayTrackHeroTitle: { fontSize: 18, fontWeight: '900' },
-  todayTrackHeroSub: { fontSize: 12, marginTop: 4, lineHeight: 17 },
-  personTrackCard: { borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1 },
-  personTrackHeader: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  personTrackAvatar: { width: 38, height: 38, borderRadius: 19, borderWidth: 1.5 },
-  personTrackAvatarFallback: { width: 38, height: 38, borderRadius: 19, borderWidth: 1.5, alignItems: 'center', justifyContent: 'center' },
-  personTrackName: { fontSize: 15, fontWeight: '800' },
-  personTrackHandle: { fontSize: 11, marginTop: 1 },
-  personSolvedCountBadge: { paddingVertical: 4, paddingHorizontal: 8, borderRadius: 8, borderWidth: 1 },
-  personSolvedCountText: { fontSize: 11, fontWeight: '800' },
-  personSubRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderRadius: 10, marginBottom: 6, borderWidth: 1 },
-  noSubPersonBox: { padding: 10, borderRadius: 10, marginTop: 8, alignItems: 'center' },
+  personTrackCard: { borderRadius: 18, padding: 16, marginBottom: 14, borderWidth: 1 },
+  personTrackHeader: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  personTrackAvatar: { width: 42, height: 42, borderRadius: 21, borderWidth: 1.5 },
+  personTrackAvatarFallback: { width: 42, height: 42, borderRadius: 21, borderWidth: 1.5, alignItems: 'center', justifyContent: 'center' },
+  personTrackName: { fontSize: 16, fontWeight: '900' },
+  personTrackHandle: { fontSize: 12, marginTop: 1 },
+  personSolvedCountBadge: { paddingVertical: 5, paddingHorizontal: 10, borderRadius: 8, borderWidth: 1 },
+  personSolvedCountText: { fontSize: 12, fontWeight: '900' },
+  personSubRow: { flexDirection: 'row', alignItems: 'center', padding: 12, borderRadius: 12, marginBottom: 8, borderWidth: 1 },
+  inlineQuestionRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, flex: 1 },
+  compactDiffBadge: { width: 18, height: 18, borderRadius: 4, borderWidth: 1, alignItems: 'center', justifyContent: 'center', marginTop: 1 },
+  compactDiffText: { fontSize: 10, fontWeight: '900' },
+  recentTitle: { fontSize: 14, fontWeight: '800', flex: 1, flexWrap: 'wrap', lineHeight: 19 },
+  noSubPersonBox: { padding: 12, borderRadius: 10, marginTop: 10, alignItems: 'center' },
 
-  difficultyContainer: { flexDirection: 'row', gap: 8, marginTop: 12 },
-  diffItemBox: { flex: 1, paddingVertical: 14, paddingHorizontal: 6, borderRadius: 12, alignItems: 'center', borderWidth: 1 },
-  diffNumber: { fontSize: 18, fontWeight: '900' },
-  diffLabel: { fontSize: 11, fontWeight: '700', marginTop: 4 },
+  difficultyContainer: { flexDirection: 'row', gap: 8, marginTop: 14 },
+  diffItemBox: { flex: 1, paddingVertical: 16, paddingHorizontal: 6, borderRadius: 14, alignItems: 'center', borderWidth: 1 },
+  diffNumber: { fontSize: 20, fontWeight: '900' },
+  diffLabel: { fontSize: 12, fontWeight: '800', marginTop: 4 },
 
-  statsGrid: { flexDirection: 'row', gap: 8, marginBottom: 14 },
-  gridItem: { flex: 1, borderRadius: 14, padding: 14, alignItems: 'center', borderWidth: 1 },
-  gridVal: { fontSize: 15, fontWeight: '900' },
-  gridLbl: { fontSize: 9, marginTop: 3, textTransform: 'uppercase', fontWeight: '700' },
+  statsGrid: { flexDirection: 'row', gap: 8, marginBottom: 16 },
+  gridItem: { flex: 1, borderRadius: 16, padding: 16, alignItems: 'center', borderWidth: 1 },
+  gridVal: { fontSize: 16, fontWeight: '900' },
+  gridLbl: { fontSize: 10, marginTop: 4, textTransform: 'uppercase', fontWeight: '800' },
 
-  heatmapHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
-  heatmapSubText: { fontSize: 10, marginTop: 2 },
-  tooltipBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: '#38bdf8' },
-  tooltipText: { color: '#38bdf8', fontSize: 10, fontWeight: '700' },
-  matrixScroll: { borderRadius: 12, padding: 10, borderWidth: 1 },
-  weeksRowContainer: { flexDirection: 'row', gap: 3 },
-  weekColumn: { alignItems: 'center', gap: 3 },
-  monthHeaderSlot: { height: 16, justifyContent: 'center' },
-  monthHeaderText: { fontSize: 9, fontWeight: '800' },
-  leetCodeSquare: { width: 14, height: 14, borderRadius: 2.5, borderWidth: 0.5 },
-  heatmapLegend: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 4, marginTop: 10 },
-  legendBox: { width: 10, height: 10, borderRadius: 2 },
-  legendText: { fontSize: 10, marginHorizontal: 2 },
+  heatmapHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  tooltipBadge: { paddingHorizontal: 9, paddingVertical: 4, borderRadius: 6, borderWidth: 1 },
+  tooltipText: { fontSize: 10, fontWeight: '800' },
 
-  topicGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 12 },
-  topicBadge: { paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, borderWidth: 1 },
-  topicName: { fontSize: 11, fontWeight: '700' },
-  topicCount: { fontSize: 9, marginTop: 1, fontWeight: '600' },
-  pastHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
-  pastCountText: { fontSize: 11, fontWeight: '600' },
-  recentRow: { flexDirection: 'row', alignItems: 'center', padding: 12, borderRadius: 12, marginBottom: 8, borderWidth: 1 },
-  recentCheckIcon: { width: 22, height: 22, borderRadius: 11, backgroundColor: '#10b98115', alignItems: 'center', justifyContent: 'center', marginRight: 10 },
-  recentTitle: { fontSize: 13, fontWeight: '700' },
-  recentDate: { fontSize: 10, marginTop: 2 },
-  openBtnTag: { paddingVertical: 4, paddingHorizontal: 8, borderRadius: 6, borderWidth: 1 },
-  openBtnText: { color: '#38bdf8', fontSize: 11, fontWeight: '800' },
-  noSubBox: { padding: 14, borderRadius: 12, alignItems: 'center', borderWidth: 1 },
+  matrixScroll: {
+    borderRadius: 14,
+    padding: 12,
+    borderWidth: 1,
+  },
+  monthsContainerRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+  },
+  monthBlock: {
+    alignItems: 'flex-start',
+  },
+  monthBlockLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    marginBottom: 6,
+  },
+  monthWeeksRow: {
+    flexDirection: 'row',
+    gap: 3,
+  },
+  weekColumn: {
+    alignItems: 'center',
+    gap: 3,
+  },
+  leetCodeSquare: {
+    width: 12,
+    height: 12,
+    borderRadius: 2.5,
+  },
+  heatmapLegend: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 5,
+    marginTop: 12,
+  },
+  legendBox: {
+    width: 11,
+    height: 11,
+    borderRadius: 2.5,
+  },
+  legendText: {
+    fontSize: 10,
+    marginHorizontal: 2,
+    fontWeight: '600',
+  },
 
-  modalShade: { flex: 1, backgroundColor: 'rgba(5,8,16,0.85)', justifyContent: 'flex-end' },
-  sheet: { borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 20, maxHeight: '85%', borderWidth: 1 },
-  modalHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
-  modalTitle: { fontSize: 20, fontWeight: '900' },
-  sheetClose: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
-  sheetCloseText: { fontSize: 13, fontWeight: '800' },
-  toggleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 14, borderRadius: 12, borderWidth: 1 },
-  toggleLabel: { fontSize: 14, fontWeight: '700' },
-  sheetSub: { fontSize: 13, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.5 },
+  topicGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 14 },
+  topicBadge: { paddingVertical: 7, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1 },
+  topicName: { fontSize: 12, fontWeight: '800' },
+  topicCount: { fontSize: 10, marginTop: 1, fontWeight: '700' },
+  pastHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  pastCountText: { fontSize: 12, fontWeight: '700' },
+  recentRow: { flexDirection: 'row', alignItems: 'center', padding: 14, borderRadius: 14, marginBottom: 8, borderWidth: 1 },
+  recentCheckIcon: { width: 24, height: 24, borderRadius: 12, backgroundColor: '#10b98115', alignItems: 'center', justifyContent: 'center', marginRight: 10 },
+  recentDate: { fontSize: 11, marginTop: 2 },
+  openBtnTag: { paddingVertical: 5, paddingHorizontal: 10, borderRadius: 8, borderWidth: 1 },
+  openBtnText: { fontSize: 11, fontWeight: '900' },
+  noSubBox: { padding: 16, borderRadius: 14, alignItems: 'center', borderWidth: 1 },
 
-  customTimePickerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 12, borderRadius: 14, borderWidth: 1, gap: 10 },
+  modalShade: { flex: 1, backgroundColor: 'rgba(3,5,10,0.88)', justifyContent: 'flex-end' },
+  sheet: { borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 22, maxHeight: '85%', borderWidth: 1 },
+  modalHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 },
+  modalTitle: { fontSize: 22, fontWeight: '900' },
+  sheetClose: { width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center' },
+  sheetCloseText: { fontSize: 14, fontWeight: '900' },
+  toggleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderRadius: 14, borderWidth: 1 },
+  toggleLabel: { fontSize: 15, fontWeight: '800' },
+  sheetSub: { fontSize: 13, fontWeight: '900', textTransform: 'uppercase', letterSpacing: 0.6 },
+
+  customTimePickerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 14, borderRadius: 16, borderWidth: 1, gap: 12 },
   timeInputContainer: { alignItems: 'center' },
-  timeDigitInput: { fontSize: 22, fontWeight: '900', textAlign: 'center', width: 62, height: 50, borderRadius: 10, borderWidth: 1 },
-  timeInputSub: { fontSize: 9, marginTop: 4, fontWeight: '600' },
-  timeColon: { fontSize: 24, fontWeight: '900', marginBottom: 12 },
-  amPmContainer: { flexDirection: 'column', gap: 4, marginLeft: 6 },
-  amPmBtn: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6, borderWidth: 1 },
-  amPmText: { fontSize: 11, fontWeight: '800' },
+  timeDigitInput: { fontSize: 24, fontWeight: '900', textAlign: 'center', width: 68, height: 54, borderRadius: 12, borderWidth: 1 },
+  timeInputSub: { fontSize: 10, marginTop: 4, fontWeight: '700' },
+  timeColon: { fontSize: 26, fontWeight: '900', marginBottom: 12 },
+  amPmContainer: { flexDirection: 'column', gap: 5, marginLeft: 8 },
+  amPmBtn: { paddingVertical: 7, paddingHorizontal: 14, borderRadius: 8, borderWidth: 1 },
+  amPmText: { fontSize: 12, fontWeight: '900' },
 
   timeSlotRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  timeSlotBtn: { flex: 1, minWidth: '45%', paddingVertical: 10, alignItems: 'center', borderRadius: 10, borderWidth: 1 },
-  timeSlotText: { fontSize: 11, fontWeight: '700' },
-  actionMainBtn: { borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: 18 },
-  actionMainBtnText: { color: '#fff', fontSize: 14, fontWeight: '800' },
+  timeSlotBtn: { flex: 1, minWidth: '45%', paddingVertical: 12, alignItems: 'center', borderRadius: 12, borderWidth: 1 },
+  timeSlotText: { fontSize: 12, fontWeight: '800' },
+  actionMainBtn: { borderRadius: 14, paddingVertical: 16, alignItems: 'center', marginTop: 20 },
+  actionMainBtnText: { color: '#fff', fontSize: 15, fontWeight: '900' },
 });

@@ -6,6 +6,7 @@ export interface RecentSubmission {
   timestamp: string;
   rawTimestamp?: number;
   lang?: string;
+  difficulty?: 'Easy' | 'Medium' | 'Hard';
 }
 
 export interface TopicTag {
@@ -26,6 +27,11 @@ export interface HeatmapWeek {
   weekIndex: number;
   days: (HeatmapSquare | null)[];
   monthLabel?: string;
+}
+
+export interface HeatmapMonthGroup {
+  monthName: string;
+  weeks: HeatmapWeek[];
 }
 
 export interface DailyChallenge {
@@ -55,7 +61,47 @@ export interface LeetCodeStats {
   recentSubmissions: RecentSubmission[];
   topTopics: TopicTag[];
   heatmapWeeks: HeatmapWeek[];
+  heatmapMonthGroups?: HeatmapMonthGroup[];
   totalActiveDays: number;
+}
+
+// In-memory cache for problem difficulties to prevent duplicate network calls
+const difficultyCache: Record<string, 'Easy' | 'Medium' | 'Hard'> = {};
+
+export async function fetchQuestionDifficulty(titleSlug: string): Promise<'Easy' | 'Medium' | 'Hard'> {
+  if (!titleSlug) return 'Medium';
+  const cleanSlug = titleSlug.toLowerCase().trim();
+  if (difficultyCache[cleanSlug]) return difficultyCache[cleanSlug];
+
+  const query = `
+    query getQuestionDiff($titleSlug: String!) {
+      question(titleSlug: $titleSlug) {
+        difficulty
+      }
+    }
+  `;
+
+  try {
+    const res = await fetch('https://leetcode.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0',
+      },
+      body: JSON.stringify({ query, variables: { titleSlug: cleanSlug } }),
+    });
+
+    if (res.ok) {
+      const json = await res.json();
+      const diff = json.data?.question?.difficulty;
+      if (diff === 'Easy' || diff === 'Medium' || diff === 'Hard') {
+        difficultyCache[cleanSlug] = diff;
+        return diff;
+      }
+    }
+  } catch (_) {}
+
+  return 'Medium';
 }
 
 export async function fetchDailyChallenge(): Promise<DailyChallenge> {
@@ -66,6 +112,7 @@ export async function fetchDailyChallenge(): Promise<DailyChallenge> {
         link
         question {
           title
+          titleSlug
           difficulty
           topicTags {
             name
@@ -89,6 +136,10 @@ export async function fetchDailyChallenge(): Promise<DailyChallenge> {
       const json = await res.json();
       const daily = json.data?.activeDailyCodingChallengeQuestion;
       if (daily?.question) {
+        if (daily.question.titleSlug && daily.question.difficulty) {
+          difficultyCache[daily.question.titleSlug.toLowerCase()] = daily.question.difficulty;
+        }
+
         return {
           date: daily.date,
           title: daily.question.title,
@@ -141,11 +192,16 @@ function checkSolvedTodayAccurate(recentList: RecentSubmission[], dailyProblemTi
   });
 }
 
-function parseLeetCodeCalendarMatrix(rawCalendar: any): { weeks: HeatmapWeek[]; streak: number; totalActiveDays: number } {
+function parseLeetCodeCalendarMatrix(rawCalendar: any): { 
+  weeks: HeatmapWeek[]; 
+  monthGroups: HeatmapMonthGroup[]; 
+  streak: number; 
+  totalActiveDays: number 
+} {
   let calendarMap: Record<string, number> = {};
   try {
     if (typeof rawCalendar === 'string') {
-      calendarMap = JSON.parse(rawCalendar);
+      calendarMap = JSON.parse(rawCalendar || '{}');
     } else if (typeof rawCalendar === 'object' && rawCalendar !== null) {
       calendarMap = rawCalendar;
     }
@@ -155,76 +211,77 @@ function parseLeetCodeCalendarMatrix(rawCalendar: any): { weeks: HeatmapWeek[]; 
 
   let totalAllTimeActiveDays = 0;
   for (const cnt of Object.values(calendarMap)) {
-    if (Number(cnt) > 0) {
-      totalAllTimeActiveDays++;
-    }
+    if (Number(cnt) > 0) totalAllTimeActiveDays++;
   }
 
   const now = new Date();
   const todayUtc = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / 1000);
   const SECONDS_PER_DAY = 86400;
 
-  const totalWeeks = 20;
-  const totalDays = totalWeeks * 7;
-  const todayDayOfWeek = now.getUTCDay();
-  const startDateUtc = todayUtc - ((totalDays - 1 - (6 - todayDayOfWeek)) * SECONDS_PER_DAY);
-
-  const weeks: HeatmapWeek[] = [];
-  let currentWeek: (HeatmapSquare | null)[] = new Array(7).fill(null);
-  let weekIdx = 0;
-  let lastMonth = -1;
-
   const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const monthGroups: HeatmapMonthGroup[] = [];
+  const allWeeks: HeatmapWeek[] = [];
 
-  for (let i = 0; i < totalDays; i++) {
-    const dayTimestamp = startDateUtc + (i * SECONDS_PER_DAY);
-    const dateObj = new Date(dayTimestamp * 1000);
-    const dayOfWeek = dateObj.getUTCDay();
-    const month = dateObj.getUTCMonth();
-    const isFutureDay = dayTimestamp > todayUtc;
-    const isCurrentDay = Math.abs(dayTimestamp - todayUtc) < 3600;
+  let globalWeekIdx = 0;
 
-    if (!isFutureDay) {
-      let count = 0;
-      for (const [epochStr, cnt] of Object.entries(calendarMap)) {
-        const epoch = parseInt(epochStr, 10);
-        if (Math.abs(epoch - dayTimestamp) < SECONDS_PER_DAY) {
-          count = Number(cnt) || 0;
-          break;
+  // Build rolling 12 months matrix
+  for (let mOffset = 11; mOffset >= 0; mOffset--) {
+    const targetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - mOffset, 1));
+    const year = targetDate.getUTCFullYear();
+    const month = targetDate.getUTCMonth();
+    const monthName = monthNames[month];
+
+    const daysInMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+    const monthWeeks: HeatmapWeek[] = [];
+    let currentWeek: (HeatmapSquare | null)[] = new Array(7).fill(null);
+
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dObj = new Date(Date.UTC(year, month, day));
+      const dayTimestamp = Math.floor(dObj.getTime() / 1000);
+      const dayOfWeek = dObj.getUTCDay();
+
+      if (dayTimestamp <= todayUtc) {
+        let count = 0;
+        for (const [epochStr, cnt] of Object.entries(calendarMap)) {
+          const epoch = parseInt(epochStr, 10);
+          if (Math.abs(epoch - dayTimestamp) < SECONDS_PER_DAY) {
+            count = Number(cnt) || 0;
+            break;
+          }
         }
+
+        let level = 0;
+        if (count >= 5) level = 3;
+        else if (count >= 3) level = 2;
+        else if (count >= 1) level = 1;
+
+        currentWeek[dayOfWeek] = {
+          date: dObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+          count,
+          level,
+          dayOfWeek,
+          isToday: Math.abs(dayTimestamp - todayUtc) < 3600,
+        };
+      } else {
+        currentWeek[dayOfWeek] = null;
       }
 
-      let level = 0;
-      if (count >= 5) level = 3;
-      else if (count >= 3) level = 2;
-      else if (count >= 1) level = 1;
-
-      let monthLabel: string | undefined;
-      if (month !== lastMonth && dayOfWeek <= 2) {
-        monthLabel = monthNames[month];
-        lastMonth = month;
+      if (dayOfWeek === 6 || day === daysInMonth) {
+        const weekObj: HeatmapWeek = {
+          weekIndex: globalWeekIdx++,
+          days: [...currentWeek],
+        };
+        monthWeeks.push(weekObj);
+        allWeeks.push(weekObj);
+        currentWeek = new Array(7).fill(null);
       }
-
-      currentWeek[dayOfWeek] = {
-        date: dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-        count,
-        level,
-        dayOfWeek,
-        monthLabel,
-        isToday: isCurrentDay,
-      };
-    } else {
-      currentWeek[dayOfWeek] = null;
     }
 
-    if (dayOfWeek === 6 || i === totalDays - 1) {
-      const label = currentWeek.find((d) => d?.monthLabel)?.monthLabel;
-      weeks.push({
-        weekIndex: weekIdx++,
-        days: [...currentWeek],
-        monthLabel: label,
+    if (monthWeeks.length > 0) {
+      monthGroups.push({
+        monthName,
+        weeks: monthWeeks,
       });
-      currentWeek = new Array(7).fill(null);
     }
   }
 
@@ -250,10 +307,14 @@ function parseLeetCodeCalendarMatrix(rawCalendar: any): { weeks: HeatmapWeek[]; 
     }
   }
 
-  return { weeks, streak: currentStreak, totalActiveDays: totalAllTimeActiveDays };
+  return { 
+    weeks: allWeeks, 
+    monthGroups, 
+    streak: currentStreak, 
+    totalActiveDays: totalAllTimeActiveDays 
+  };
 }
 
-// Helper to extract authentic topic breakdown from GraphQL tagProblemCounts
 function parseTopTopics(tagCounts: any): TopicTag[] {
   if (!tagCounts) return [];
 
@@ -273,28 +334,7 @@ function parseTopTopics(tagCounts: any): TopicTag[] {
     }
   });
 
-  // Sort descending by problems solved and pick the top topics
   return allTags.sort((a, b) => b.solved - a.solved).slice(0, 8);
-}
-
-async function getRecentSubmissionsSafe(clean: string): Promise<RecentSubmission[]> {
-  try {
-    const res = await fetch(`https://alfa-leetcode-api.onrender.com/${clean}/acSubmission?limit=15`);
-    if (res.ok) {
-      const json = await res.json();
-      const list = Array.isArray(json) ? json : json.submission;
-      if (Array.isArray(list) && list.length > 0) {
-        return list.map((s: any) => ({
-          id: String(s.id || Math.random()),
-          title: s.title || s.titleSlug || 'Accepted Problem',
-          timestamp: formatTimestamp(s.timestamp),
-          rawTimestamp: parseRawEpochSeconds(s.timestamp),
-          lang: s.lang,
-        }));
-      }
-    }
-  } catch (_) {}
-  return [];
 }
 
 export async function fetchLeetCodeStats(
@@ -304,9 +344,8 @@ export async function fetchLeetCodeStats(
   const clean = username.trim();
   if (!clean) return null;
 
-  // Primary: Official LeetCode GraphQL with real tagProblemCounts
   const graphqlQuery = `
-    query getUserProfileWithSkills($username: String!) {
+    query getUserProfileWithContest($username: String!) {
       matchedUser(username: $username) {
         username
         profile {
@@ -344,6 +383,14 @@ export async function fetchLeetCodeStats(
           submissionCalendar
         }
       }
+      userContestRanking(username: $username) {
+        attendedContestsCount
+        rating
+        globalRanking
+        badge {
+          name
+        }
+      }
       recentAcSubmissionList(username: $username, limit: 15) {
         id
         title
@@ -366,6 +413,7 @@ export async function fetchLeetCodeStats(
     if (response.ok) {
       const json = await response.json();
       const matched = json.data?.matchedUser;
+      const contest = json.data?.userContestRanking;
 
       if (matched) {
         const acStats = matched.submitStatsGlobal?.acSubmissionNum || [];
@@ -387,15 +435,25 @@ export async function fetchLeetCodeStats(
           officialRate = Math.round((totalAcSubmissions / totalRawSubmissions) * 100);
         }
 
-        const { weeks, streak, totalActiveDays } = parseLeetCodeCalendarMatrix(matched.userCalendar?.submissionCalendar);
+        const { weeks, monthGroups, streak, totalActiveDays } = parseLeetCodeCalendarMatrix(matched.userCalendar?.submissionCalendar);
         const topTopics = parseTopTopics(matched.tagProblemCounts);
 
-        const recent: RecentSubmission[] = (json.data?.recentAcSubmissionList || []).map((s: any) => ({
-          id: String(s.id || s.title),
-          title: s.title || s.titleSlug,
-          timestamp: formatTimestamp(s.timestamp),
-          rawTimestamp: parseRawEpochSeconds(s.timestamp),
-        }));
+        const rawRecent = json.data?.recentAcSubmissionList || [];
+        
+        // Resolve authentic difficulty for each recent submission concurrently
+        const recent: RecentSubmission[] = await Promise.all(
+          rawRecent.map(async (s: any) => {
+            const slug = s.titleSlug || s.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+            const diff = await fetchQuestionDifficulty(slug);
+            return {
+              id: String(s.id || s.title),
+              title: s.title || s.titleSlug,
+              timestamp: formatTimestamp(s.timestamp),
+              rawTimestamp: parseRawEpochSeconds(s.timestamp),
+              difficulty: diff,
+            };
+          })
+        );
 
         const isSolvedToday = checkSolvedTodayAccurate(recent, dailyProblemTitle);
 
@@ -404,10 +462,10 @@ export async function fetchLeetCodeStats(
           realName: matched.profile?.realName || clean,
           avatar: matched.profile?.userAvatar,
           ranking: matched.profile?.ranking || 0,
-          contestRating: 0,
-          contestGlobalRank: 0,
-          contestAttended: 0,
-          contestBadge: 'Active',
+          contestRating: contest?.rating ? Math.round(contest.rating) : 0,
+          contestGlobalRank: contest?.globalRanking || 0,
+          contestAttended: contest?.attendedContestsCount || 0,
+          contestBadge: contest?.badge?.name || 'Active',
           streak,
           solvedDailyToday: isSolvedToday,
           totalSolved: total,
@@ -418,58 +476,7 @@ export async function fetchLeetCodeStats(
           recentSubmissions: recent,
           topTopics: topTopics.length > 0 ? topTopics : [{ name: 'Algorithms', solved: total }],
           heatmapWeeks: weeks,
-          totalActiveDays,
-        };
-      }
-    }
-  } catch (_) {}
-
-  // Fallback REST endpoint
-  try {
-    const res = await fetch(`https://leetcode-api-faisalshohag.vercel.app/${clean}`);
-    if (res.ok) {
-      const data = await res.json();
-      if (data && (data.totalSolved !== undefined || data.ranking !== undefined || data.name !== undefined)) {
-        const easy = data.easySolved || 0;
-        const medium = data.mediumSolved || 0;
-        const hard = data.hardSolved || 0;
-        const total = data.totalSolved || (easy + medium + hard);
-
-        const { weeks, streak, totalActiveDays } = parseLeetCodeCalendarMatrix(data.submissionCalendar);
-        const fallbackSubs = await getRecentSubmissionsSafe(clean);
-
-        let recent: RecentSubmission[] = fallbackSubs;
-        if (recent.length === 0 && Array.isArray(data.recentSubmissions)) {
-          recent = data.recentSubmissions.slice(0, 15).map((s: any) => ({
-            id: String(s.id || s.title),
-            title: s.title || 'Accepted Submission',
-            timestamp: formatTimestamp(s.timestamp),
-            rawTimestamp: parseRawEpochSeconds(s.timestamp),
-            lang: s.lang,
-          }));
-        }
-
-        const isSolvedToday = checkSolvedTodayAccurate(recent, dailyProblemTitle);
-
-        return {
-          username: clean,
-          realName: data.name || clean,
-          avatar: data.avatar,
-          ranking: data.ranking || 0,
-          contestRating: 0,
-          contestGlobalRank: 0,
-          contestAttended: 0,
-          contestBadge: 'Active',
-          streak,
-          solvedDailyToday: isSolvedToday,
-          totalSolved: total,
-          easySolved: easy,
-          mediumSolved: medium,
-          hardSolved: hard,
-          acceptanceRate: data.acceptanceRate ? Math.round(data.acceptanceRate) : 0,
-          recentSubmissions: recent,
-          topTopics: [{ name: 'Algorithms', solved: total }],
-          heatmapWeeks: weeks,
+          heatmapMonthGroups: monthGroups,
           totalActiveDays,
         };
       }
