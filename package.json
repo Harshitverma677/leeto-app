@@ -3,23 +3,31 @@
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
+    "@expo/metro-runtime": "~57.0.15",
     "@react-native-async-storage/async-storage": "2.2.0",
-    "expo": "~54.0.0",
-    "expo-device": "~8.0.10",
-    "expo-notifications": "~0.32.17",
-    "expo-status-bar": "~3.0.9",
-    "expo-updates": "~29.0.20",
+    "crypto-js": "^4.2.0",
+    "expo": "^57.0.0",
+    "expo-device": "~57.0.2",
+    "expo-notifications": "~57.0.18",
+    "expo-status-bar": "~57.0.1",
+    "expo-updates": "~57.0.22",
+    "firebase": "^12.19.0",
     "lucide-react-native": "^1.33.0",
     "node-fetch": "^2.7.0",
-    "react": "19.1.0",
-    "react-native": "0.81.5",
-    "react-native-safe-area-context": "~5.6.0"
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-svg": "15.15.4",
+    "react-native-web": "^0.21.0"
   },
   "devDependencies": {
-    "@types/react": "~19.1.10",
-    "typescript": "~5.9.2"
+    "@types/crypto-js": "^4.2.2",
+    "@types/react": "~19.2.4",
+    "typescript": "~6.0.3"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-expo-notifications.js",
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",

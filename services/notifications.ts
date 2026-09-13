@@ -8,7 +8,9 @@ const EAS_PROJECT_ID = 'd2154c73-429b-4349-882d-dc09cb0e5de3';
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
-    shouldShowAlert: true,
+    // shouldShowAlert is deprecated — use shouldShowBanner + shouldShowList
+    shouldShowBanner: true,
+    shouldShowList: true,
     shouldPlaySound: true,
     shouldSetBadge: true,
   }),
@@ -16,14 +18,23 @@ Notifications.setNotificationHandler({
 
 export async function requestNotificationPermissions(): Promise<boolean> {
   try {
-    if (Platform.OS === 'android') {
-      await Notifications.setNotificationChannelAsync('leetdash-alerts', {
-        name: 'LeetCode Updates',
-        importance: Notifications.AndroidImportance.MAX,
-        vibrationPattern: [0, 250, 250, 250],
-        lightColor: '#f97316',
-        sound: 'default',
-      });
+    if (Platform.OS === 'web') return false;
+
+    // In Expo Go, setNotificationChannelAsync is unavailable and throws NullPointerException.
+    // Skip channel creation entirely — it is only needed in standalone/EAS builds.
+    const isExpoGo = Constants.appOwnership === 'expo';
+    if (Platform.OS === 'android' && !isExpoGo) {
+      try {
+        await Notifications.setNotificationChannelAsync('leetdash-alerts', {
+          name: 'LeetCode Updates',
+          importance: Notifications.AndroidImportance.MAX,
+          vibrationPattern: [0, 250, 250, 250],
+          lightColor: '#f97316',
+          sound: 'default',
+        });
+      } catch (channelErr) {
+        console.warn('Could not set notification channel:', channelErr);
+      }
     }
 
     const { status: existingStatus } = await Notifications.getPermissionsAsync();
@@ -36,13 +47,20 @@ export async function requestNotificationPermissions(): Promise<boolean> {
 
     return finalStatus === 'granted';
   } catch (error) {
-    console.error('Error requesting notification permissions:', error);
+    console.warn('Notice requesting notification permissions:', error);
     return false;
   }
 }
 
+
 export async function getDevicePushToken(): Promise<string | null> {
   try {
+    // In Expo Go or Web, remote push tokens are unsupported and can throw fatal exceptions
+    if (Constants.appOwnership === 'expo' || Platform.OS === 'web') {
+      console.log('Skipping remote push token registration in Expo Go / Web environment');
+      return null;
+    }
+
     const hasPermission = await requestNotificationPermissions();
     if (!hasPermission) {
       console.warn('Notification permission not granted.');
@@ -54,13 +72,15 @@ export async function getDevicePushToken(): Promise<string | null> {
       Constants.easConfig?.projectId ??
       EAS_PROJECT_ID;
 
+    if (!projectId) return null;
+
     const tokenResponse = await Notifications.getExpoPushTokenAsync({
       projectId,
     });
 
-    return tokenResponse.data;
+    return tokenResponse?.data ?? null;
   } catch (error) {
-    console.error('Error fetching Expo Push Token:', error);
+    console.warn('Notice fetching Expo Push Token (non-fatal):', error);
     return null;
   }
 }
@@ -161,15 +181,35 @@ export async function scheduleDailyStreakReminder(
 export async function triggerLocalSolveNotification(
   playerName: string,
   problemTitle: string,
-  problemUrl: string
+  problemUrl: string,
+  solvedAtTimestamp?: number  // Unix epoch seconds from LeetCode API
 ) {
   try {
     await requestNotificationPermissions();
 
+    // Format solve time: show "just now", "X min ago", or exact time
+    let timeLabel = '';
+    if (solvedAtTimestamp && solvedAtTimestamp > 0) {
+      const solvedMs = solvedAtTimestamp * 1000;
+      const diffMin = Math.floor((Date.now() - solvedMs) / 60000);
+      if (diffMin < 1) {
+        timeLabel = ' · just now';
+      } else if (diffMin < 60) {
+        timeLabel = ` · ${diffMin}m ago`;
+      } else {
+        const d = new Date(solvedMs);
+        const h = d.getHours();
+        const m = d.getMinutes();
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        const h12 = h % 12 === 0 ? 12 : h % 12;
+        timeLabel = ` · at ${h12}:${m.toString().padStart(2, '0')} ${ampm}`;
+      }
+    }
+
     await Notifications.scheduleNotificationAsync({
       content: {
         title: `🎯 ${playerName} solved a problem!`,
-        body: `"${problemTitle}" — Tap to view this problem.`,
+        body: `"${problemTitle}"${timeLabel} — Tap to view.`,
         data: { url: problemUrl, type: 'solve_alert' },
         sound: 'default',
         ...(Platform.OS === 'android' ? { channelId: 'leetdash-alerts' } : {}),
@@ -183,6 +223,7 @@ export async function triggerLocalSolveNotification(
     console.error('Error triggering notification:', error);
   }
 }
+
 
 export async function triggerStreakShieldAlert(
   problemTitle: string,

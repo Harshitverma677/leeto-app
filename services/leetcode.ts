@@ -1,4 +1,5 @@
 // services/leetcode.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export interface RecentSubmission {
   id: string;
@@ -66,11 +67,63 @@ export interface LeetCodeStats {
 }
 
 // In-memory cache for problem difficulties to prevent duplicate network calls
-const difficultyCache: Record<string, 'Easy' | 'Medium' | 'Hard'> = {};
+let difficultyCache: Record<string, 'Easy' | 'Medium' | 'Hard'> = {};
+let isDifficultyCacheLoaded = false;
+
+const DIFFICULTY_CACHE_KEY = '@leetdash_difficulty_cache';
+const DAILY_PROBLEM_CACHE_KEY = '@leetdash_cached_daily_challenge';
+const MEMBERS_STATS_CACHE_KEY = '@leetdash_cached_member_stats';
+
+export async function loadCachedDifficultyMap() {
+  if (isDifficultyCacheLoaded) return;
+  try {
+    const raw = await AsyncStorage.getItem(DIFFICULTY_CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      difficultyCache = { ...parsed, ...difficultyCache };
+    }
+    isDifficultyCacheLoaded = true;
+  } catch (_) {}
+}
+
+export async function getCachedDailyChallenge(): Promise<DailyChallenge | null> {
+  try {
+    const raw = await AsyncStorage.getItem(DAILY_PROBLEM_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+export async function saveCachedDailyChallenge(daily: DailyChallenge): Promise<void> {
+  try {
+    await AsyncStorage.setItem(DAILY_PROBLEM_CACHE_KEY, JSON.stringify(daily));
+  } catch (_) {}
+}
+
+export async function getCachedMemberStats(): Promise<LeetCodeStats[]> {
+  try {
+    const raw = await AsyncStorage.getItem(MEMBERS_STATS_CACHE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+export async function saveCachedMemberStats(stats: LeetCodeStats[]): Promise<void> {
+  try {
+    await AsyncStorage.setItem(MEMBERS_STATS_CACHE_KEY, JSON.stringify(stats));
+  } catch (_) {}
+}
 
 export async function fetchQuestionDifficulty(titleSlug: string): Promise<'Easy' | 'Medium' | 'Hard'> {
   if (!titleSlug) return 'Medium';
   const cleanSlug = titleSlug.toLowerCase().trim();
+
+  if (!isDifficultyCacheLoaded) {
+    await loadCachedDifficultyMap();
+  }
+
   if (difficultyCache[cleanSlug]) return difficultyCache[cleanSlug];
 
   const query = `
@@ -96,6 +149,8 @@ export async function fetchQuestionDifficulty(titleSlug: string): Promise<'Easy'
       const diff = json.data?.question?.difficulty;
       if (diff === 'Easy' || diff === 'Medium' || diff === 'Hard') {
         difficultyCache[cleanSlug] = diff;
+        // Debounced save
+        AsyncStorage.setItem(DIFFICULTY_CACHE_KEY, JSON.stringify(difficultyCache)).catch(() => {});
         return diff;
       }
     }
@@ -140,16 +195,21 @@ export async function fetchDailyChallenge(): Promise<DailyChallenge> {
           difficultyCache[daily.question.titleSlug.toLowerCase()] = daily.question.difficulty;
         }
 
-        return {
+        const result: DailyChallenge = {
           date: daily.date,
           title: daily.question.title,
           difficulty: daily.question.difficulty || 'Medium',
           link: `https://leetcode.com${daily.link}`,
           topicTags: (daily.question.topicTags || []).map((t: any) => t.name),
         };
+        saveCachedDailyChallenge(result);
+        return result;
       }
     }
   } catch (_) {}
+
+  const cached = await getCachedDailyChallenge();
+  if (cached) return cached;
 
   return {
     date: new Date().toISOString().split('T')[0],

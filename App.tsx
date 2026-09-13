@@ -15,14 +15,17 @@ import {
   Switch,
   Image,
   Animated,
+  Platform,
 } from 'react-native';
-
 import { SafeAreaView, SafeAreaProvider } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import {
   fetchLeetCodeStats,
   fetchDailyChallenge,
+  getCachedDailyChallenge,
+  getCachedMemberStats,
+  saveCachedMemberStats,
   LeetCodeStats,
   DailyChallenge,
   HeatmapSquare,
@@ -33,8 +36,15 @@ import {
   triggerLocalSolveNotification,
   triggerStreakShieldAlert,
   scheduleDailyStreakReminder,
-  broadcastSolveEvent,
 } from './services/notifications';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { NotificationProvider, useNotifications } from './context/NotificationContext';
+import { AuthModal } from './components/AuthModal';
+import { NotificationsModal } from './components/NotificationsModal';
+import { UserProfileModal } from './components/UserProfileModal';
+import { updateTrackedMembers, registerDeviceToken } from './services/firestore';
+import { sendNotification } from './services/notificationsService';
+import { auth } from './config/firebase';
 
 const STORAGE_KEY = '@leetdash_members';
 const OWNER_STORAGE_KEY = '@leetdash_owner_handle';
@@ -42,20 +52,12 @@ const LAST_SEEN_SUB_KEY = '@leetdash_last_sub_ids';
 const REMINDER_KEY = '@leetdash_reminder_settings';
 const THEME_STORAGE_KEY = '@leetdash_theme_preference';
 
-const JSONBIN_BIN_ID = '6a8adce9da38895dfe06ade0';
-const JSONBIN_API_KEY = '$2a$10$q/z2mZGd58JtaJVXLOGB0OUhQHg9cSRyh98eCwHMfPeEF2vN5DXhe';
-
 type SortKey = 'solved' | 'streak' | 'acceptance';
 
 interface ReminderSettings {
   enabled: boolean;
   hour: number;
   minute: number;
-}
-
-interface SubscriptionEntry {
-  token: string;
-  tracking: string[];
 }
 
 interface DayOption {
@@ -84,6 +86,7 @@ const darkColors = {
   green: '#10b981',
   yellow: '#f59e0b',
   red: '#f43f5e',
+  isDarkMode: true,
   statusBar: 'light-content' as const,
 };
 
@@ -105,6 +108,7 @@ const lightColors = {
   green: '#059669',
   yellow: '#d97706',
   red: '#e11d48',
+  isDarkMode: false,
   statusBar: 'dark-content' as const,
 };
 
@@ -143,13 +147,22 @@ const getUtcDateString = (): string => {
   return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`;
 };
 
-export default function App() {
+function MainDashboard() {
+  const { user, profile, isAuthenticated, signOut } = useAuth();
+  const { unreadCount, latestAlert, clearLatestAlert } = useNotifications();
+
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [ownerHandle, setOwnerHandle] = useState<string | null>(null);
   const [isSplashVisible, setIsSplashVisible] = useState(true);
   const [onboardingInput, setOnboardingInput] = useState('');
   const [onboardingLoading, setOnboardingLoading] = useState(false);
   const [pushToken, setPushToken] = useState<string | null>(null);
+
+  // Modals
+  const [authModalVisible, setAuthModalVisible] = useState(false);
+  const [authModalInitialMode, setAuthModalInitialMode] = useState<'login' | 'register'>('login');
+  const [notifModalVisible, setNotifModalVisible] = useState(false);
+  const [userProfileModalVisible, setUserProfileModalVisible] = useState(false);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerAddInput, setDrawerAddInput] = useState('');
@@ -186,12 +199,18 @@ export default function App() {
 
   const heatmapScrollRef = useRef<ScrollView>(null);
   const lastSeenSubId = useRef<Record<string, string>>({});
+  const lastNotifiedSubId = useRef<Record<string, string>>({});
   const lastReminderTriggeredUtcDate = useRef<string>('');
   const membersRef = useRef<LeetCodeStats[]>([]);
   const ownerHandleRef = useRef<string | null>(null);
   const dailyProblemRef = useRef<DailyChallenge | null>(null);
   const reminderConfigRef = useRef<ReminderSettings>(reminderConfig);
   const sortByRef = useRef<SortKey>(sortBy);
+  const userRef = useRef(user);
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   const past7Days = getPast7UtcDays();
 
@@ -215,6 +234,21 @@ export default function App() {
     sortByRef.current = sortBy;
   }, [sortBy]);
 
+  // Sync authenticated profile to ownerHandle and members list
+  useEffect(() => {
+    if (profile) {
+      const handle = profile.leetCodeHandle || profile.username;
+      setOwnerHandle(handle);
+      ownerHandleRef.current = handle;
+      AsyncStorage.setItem(OWNER_STORAGE_KEY, handle).catch(() => {});
+
+      if (profile.trackingList && profile.trackingList.length > 0) {
+        AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(profile.trackingList)).catch(() => {});
+        refreshTeam(profile.trackingList, false, false);
+      }
+    }
+  }, [profile]);
+
   useEffect(() => {
     const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
       const url = response.notification.request.content.data?.url;
@@ -226,154 +260,159 @@ export default function App() {
     return () => subscription.remove();
   }, []);
 
-  const syncCloudTracking = async (membersList: string[], tokenToUse?: string | null) => {
-    let targetToken = tokenToUse !== undefined ? tokenToUse : pushToken;
-
-    if (!targetToken) {
-      targetToken = await getDevicePushToken();
-      if (targetToken) {
-        setPushToken(targetToken);
+  // Auto-check teammates in the background every 45 seconds for real-time solve push notifications
+  useEffect(() => {
+    const autoRefreshTimer = setInterval(() => {
+      if (membersRef.current && membersRef.current.length > 0) {
+        const usernames = membersRef.current.map((m) => m.username);
+        if (usernames.length > 0) {
+          refreshTeam(usernames, true, false);
+        }
       }
-    }
+    }, 45000);
 
-    if (!targetToken) return;
+    return () => clearInterval(autoRefreshTimer);
+  }, []);
 
+  const safeJsonParse = <T,>(raw: string | null, fallback: T): T => {
+    if (!raw) return fallback;
     try {
-      const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
-        method: 'GET',
-        headers: { 'X-Master-Key': JSONBIN_API_KEY },
-      });
-
-      if (!res.ok) return;
-
-      const currentData = await res.json();
-      let subscriptions: SubscriptionEntry[] = currentData.record?.subscriptions || [];
-
-      if (!Array.isArray(subscriptions)) {
-        subscriptions = [];
-      }
-
-      const cleanMembers = Array.from(new Set(membersList.map((m) => m.trim()).filter(Boolean)));
-      const existingSubIndex = subscriptions.findIndex((sub) => sub.token === targetToken);
-
-      if (existingSubIndex >= 0) {
-        subscriptions[existingSubIndex].tracking = cleanMembers;
-      } else {
-        subscriptions.push({
-          token: targetToken,
-          tracking: cleanMembers,
-        });
-      }
-
-      await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Master-Key': JSONBIN_API_KEY,
-        },
-        body: JSON.stringify({ subscriptions }),
-      });
-    } catch (_) {}
+      return JSON.parse(raw);
+    } catch {
+      return fallback;
+    }
   };
 
+  // Performance-Optimized Startup Sequence with Guaranteed Splash Dismissal
   useEffect(() => {
+    // 1. Guaranteed safety timer: Force dismiss splash screen within 500ms under all conditions
+    const safetyTimer = setTimeout(() => {
+      setIsSplashVisible(false);
+    }, 500);
+
+    // 2. Start smooth splash animation
     Animated.parallel([
       Animated.spring(splashScale, {
         toValue: 1,
         tension: 30,
         friction: 5,
-        useNativeDriver: true,
+        useNativeDriver: Platform.OS !== 'web',
       }),
       Animated.timing(splashOpacity, {
         toValue: 1,
-        duration: 600,
-        useNativeDriver: true,
+        duration: 350,
+        useNativeDriver: Platform.OS !== 'web',
       }),
       Animated.timing(splashSubOpacity, {
         toValue: 1,
-        duration: 900,
-        delay: 250,
-        useNativeDriver: true,
+        duration: 450,
+        delay: 100,
+        useNativeDriver: Platform.OS !== 'web',
       }),
     ]).start();
 
-    initApp();
+    // 3. Initialize application using instant local cache
+    initAppFast();
 
-    const interval = setInterval(() => {
-      AsyncStorage.getItem(STORAGE_KEY).then((saved) => {
-        if (saved) refreshTeam(JSON.parse(saved), true, false);
-      });
-      checkDailyReminder();
-    }, 30000);
-
-    return () => clearInterval(interval);
+    return () => clearTimeout(safetyTimer);
   }, []);
 
-  const initApp = async () => {
+  const initAppFast = async () => {
     try {
-      await requestNotificationPermissions();
-      const token = await getDevicePushToken();
-      if (token) {
-        setPushToken(token);
-      }
+      // Step A: Load cached preferences instantly (0ms network delay)
+      const [savedTheme, savedOwner, savedReminder, savedSubIds, cachedPotd, cachedStats, savedList] =
+        await Promise.all([
+          AsyncStorage.getItem(THEME_STORAGE_KEY).catch(() => null),
+          AsyncStorage.getItem(OWNER_STORAGE_KEY).catch(() => null),
+          AsyncStorage.getItem(REMINDER_KEY).catch(() => null),
+          AsyncStorage.getItem(LAST_SEEN_SUB_KEY).catch(() => null),
+          getCachedDailyChallenge().catch(() => null),
+          getCachedMemberStats().catch(() => []),
+          AsyncStorage.getItem(STORAGE_KEY).catch(() => null),
+        ]);
 
-      const savedTheme = await AsyncStorage.getItem(THEME_STORAGE_KEY);
       if (savedTheme !== null) {
         setIsDarkMode(savedTheme === 'dark');
       }
 
-      const savedOwner = await AsyncStorage.getItem(OWNER_STORAGE_KEY);
       if (savedOwner) {
         setOwnerHandle(savedOwner);
         ownerHandleRef.current = savedOwner;
       }
 
-      const potd = await fetchDailyChallenge();
-      setDailyProblem(potd);
-      dailyProblemRef.current = potd;
+      if (cachedPotd) {
+        setDailyProblem(cachedPotd);
+        dailyProblemRef.current = cachedPotd;
+      }
 
-      const savedReminder = await AsyncStorage.getItem(REMINDER_KEY);
       if (savedReminder) {
-        const parsedReminder: ReminderSettings = JSON.parse(savedReminder);
-        setReminderConfig(parsedReminder);
-        reminderConfigRef.current = parsedReminder;
+        const parsedReminder = safeJsonParse<ReminderSettings | null>(savedReminder, null);
+        if (parsedReminder && typeof parsedReminder.hour === 'number') {
+          setReminderConfig(parsedReminder);
+          reminderConfigRef.current = parsedReminder;
 
-        const isPeriodPM = parsedReminder.hour >= 12;
-        const displayH = parsedReminder.hour % 12 === 0 ? 12 : parsedReminder.hour % 12;
-        setCustomHour(displayH < 10 ? `0${displayH}` : `${displayH}`);
-        setCustomMinute(parsedReminder.minute < 10 ? `0${parsedReminder.minute}` : `${parsedReminder.minute}`);
-        setIsPM(isPeriodPM);
-
-        if (parsedReminder.enabled && potd) {
-          scheduleDailyStreakReminder(parsedReminder.hour, parsedReminder.minute, potd.title, potd.link);
+          const isPeriodPM = parsedReminder.hour >= 12;
+          const displayH = parsedReminder.hour % 12 === 0 ? 12 : parsedReminder.hour % 12;
+          setCustomHour(displayH < 10 ? `0${displayH}` : `${displayH}`);
+          setCustomMinute(parsedReminder.minute < 10 ? `0${parsedReminder.minute}` : `${parsedReminder.minute}`);
+          setIsPM(isPeriodPM);
         }
       }
 
-      const savedSubIds = await AsyncStorage.getItem(LAST_SEEN_SUB_KEY);
       if (savedSubIds) {
-        lastSeenSubId.current = JSON.parse(savedSubIds);
+        lastSeenSubId.current = safeJsonParse<Record<string, string>>(savedSubIds, {});
       }
 
-      const saved = await AsyncStorage.getItem(STORAGE_KEY);
-      const parsedList: string[] = saved ? JSON.parse(saved) : (savedOwner ? [savedOwner] : []);
-
-      if (saved) {
-        await refreshTeam(parsedList, false, false, potd?.title);
+      // Step B: Instantly render leaderboard from local cache if available
+      if (cachedStats && cachedStats.length > 0) {
+        setMembers(sortList(cachedStats, sortByRef.current));
       }
 
-      if (token) {
-        await syncCloudTracking(parsedList, token);
-      }
-    } catch (e) {
-      console.error(e);
-    } finally {
+      // Step C: Fade out splash screen immediately so UI is interactive
       setTimeout(() => {
         Animated.timing(splashContainerOpacity, {
           toValue: 0,
-          duration: 400,
-          useNativeDriver: true,
+          duration: 300,
+          useNativeDriver: Platform.OS !== 'web',
         }).start(() => setIsSplashVisible(false));
-      }, 900);
+      }, 350);
+
+      // Step D: Asynchronous non-blocking background synchronization
+      (async () => {
+        try {
+          // Fetch latest POTD
+          const potd = await fetchDailyChallenge();
+          if (potd) {
+            setDailyProblem(potd);
+            dailyProblemRef.current = potd;
+          }
+
+          // Determine list of members to refresh
+          const parsedList = safeJsonParse<string[]>(
+            savedList,
+            savedOwner ? [savedOwner] : []
+          );
+
+          if (parsedList && parsedList.length > 0) {
+            await refreshTeam(parsedList, false, false, potd?.title);
+          }
+
+          // Register push token non-blockingly
+          const hasPermission = await requestNotificationPermissions();
+          if (hasPermission) {
+            const token = await getDevicePushToken();
+            if (token) {
+              setPushToken(token);
+              if (user?.uid) {
+                registerDeviceToken(user.uid, token);
+              }
+            }
+          }
+        } catch (_) {}
+      })();
+    } catch (e) {
+      console.warn('Startup initialization notice:', e);
+      setIsSplashVisible(false);
     }
   };
 
@@ -383,16 +422,17 @@ export default function App() {
     await AsyncStorage.setItem(THEME_STORAGE_KEY, nextMode ? 'dark' : 'light');
   };
 
-  const handleSignOut = () => {
+  const handleSignOutAction = async () => {
     Alert.alert(
       'Sign Out',
-      'Are you sure you want to sign out? This will disconnect your primary account and reset the board on this device.',
+      'Are you sure you want to sign out? This will disconnect your account session on this device.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Sign Out',
           style: 'destructive',
           onPress: async () => {
+            await signOut();
             await AsyncStorage.multiRemove([
               OWNER_STORAGE_KEY,
               STORAGE_KEY,
@@ -405,7 +445,6 @@ export default function App() {
             setIsTodayTrackScreenOpen(false);
             setDrawerOpen(false);
             setOnboardingInput('');
-            syncCloudTracking([], pushToken);
           },
         },
       ]
@@ -424,7 +463,7 @@ export default function App() {
     setOnboardingLoading(false);
 
     if (!stats) {
-      Alert.alert('Account Not Found', 'Could not locate that LeetCode handle. Please verify the spelling.');
+      Alert.alert('Account Not Found', 'Could not locate that LeetCode handle. Please verify spelling.');
       return;
     }
 
@@ -437,12 +476,12 @@ export default function App() {
     if (!list.some((u) => u.toLowerCase() === stats.username.toLowerCase())) {
       list.push(stats.username);
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-      setMembers(sortList([...members, stats], sortBy));
+      const nextMembers = sortList([...members, stats], sortBy);
+      setMembers(nextMembers);
+      saveCachedMemberStats(nextMembers);
 
-      const token = pushToken || (await getDevicePushToken());
-      if (token) {
-        setPushToken(token);
-        syncCloudTracking(list, token);
+      if (user?.uid) {
+        updateTrackedMembers(user.uid, list);
       }
     }
   };
@@ -528,18 +567,31 @@ export default function App() {
     });
   };
 
+  // Parallelized, optimized team member fetching with local caching
   const refreshTeam = async (
     usernames: string[],
     notify = true,
     showSpinner = false,
     dailyTitle?: string
   ) => {
+    if (usernames.length === 0) return;
     if (showSpinner) setRefreshing(true);
     const activeDailyTitle = dailyTitle || dailyProblemRef.current?.title;
+
+    // Parallel fetch with Promise.all to prevent sequential blocking waterfall
+    const results = await Promise.all(
+      usernames.map(async (name) => {
+        try {
+          return await fetchLeetCodeStats(name, activeDailyTitle);
+        } catch (_) {
+          return null;
+        }
+      })
+    );
+
     const updated: LeetCodeStats[] = [];
 
-    for (const name of usernames) {
-      const stats = await fetchLeetCodeStats(name, activeDailyTitle);
+    for (const stats of results) {
       if (stats) {
         updated.push(stats);
 
@@ -548,29 +600,71 @@ export default function App() {
 
         if (latestSub && latestSub.title) {
           const currentId = latestSub.id || latestSub.title;
-          if (notify && prevId && prevId !== currentId) {
+          const alreadyNotified = lastNotifiedSubId.current[stats.username] === currentId;
+
+          // A solve is new if:
+          // 1) It's different from the previously recorded submission ID (prevId !== currentId)
+          // 2) OR it was solved recently (within the last 6 hours) and has not been notified yet!
+          const isRecent = Boolean(latestSub.rawTimestamp && (Date.now() / 1000 - latestSub.rawTimestamp) < 21600);
+          const isNewSolve = !alreadyNotified && ((prevId && prevId !== currentId) || (!prevId && isRecent));
+
+          if (isNewSolve) {
+            lastNotifiedSubId.current[stats.username] = currentId;
             const problemUrl = getProblemUrlFromTitle(latestSub.title);
             const playerName = stats.realName || stats.username;
+            const rawTs = latestSub.rawTimestamp;  // Unix epoch seconds
 
-            await triggerLocalSolveNotification(
-              playerName,
-              latestSub.title,
-              problemUrl
-            );
-            broadcastSolveEvent(
-              stats.username,
-              playerName,
-              latestSub.title,
-              problemUrl
-            );
+            // Build human-readable solve time for Firestore message
+            let solveTimeStr = '';
+            if (rawTs && rawTs > 0) {
+              const diffMin = Math.floor((Date.now() - rawTs * 1000) / 60000);
+              if (diffMin < 1) solveTimeStr = ' · just now';
+              else if (diffMin < 60) solveTimeStr = ` · ${diffMin}m ago`;
+              else {
+                const d = new Date(rawTs * 1000);
+                const h = d.getHours();
+                const mn = d.getMinutes();
+                const ampm = h >= 12 ? 'PM' : 'AM';
+                const h12 = h % 12 === 0 ? 12 : h % 12;
+                solveTimeStr = ` · at ${h12}:${mn.toString().padStart(2, '0')} ${ampm}`;
+              }
+            }
+
+            // Trigger local device push with solve time
+            triggerLocalSolveNotification(playerName, latestSub.title, problemUrl, rawTs);
+
+            // Record in real-time Firestore notification database
+            const recipientUid = userRef.current?.uid || user?.uid || auth.currentUser?.uid;
+            if (recipientUid) {
+              sendNotification({
+                recipientId: recipientUid,
+                type: 'solve',
+                title: `🎯 ${playerName} solved a problem!`,
+                message: `"${latestSub.title}"${solveTimeStr} — Tap to view problem.`,
+                metadata: { url: problemUrl, username: stats.username, solvedAt: rawTs },
+              })
+                .then((docId) => {
+                  console.log(`✅ [Firestore] Created notification document ${docId} for ${playerName}`);
+                })
+                .catch((err) => {
+                  console.error('❌ [Firestore] Failed to write notification:', err);
+                });
+            } else {
+              console.warn('⚠️ [LeetDash] User not logged in, skipping Firestore record (local alert pushed)');
+            }
           }
           lastSeenSubId.current[stats.username] = currentId;
         }
       }
     }
 
-    await AsyncStorage.setItem(LAST_SEEN_SUB_KEY, JSON.stringify(lastSeenSubId.current));
-    setMembers(sortList(updated, sortByRef.current));
+    if (updated.length > 0) {
+      const sorted = sortList(updated, sortByRef.current);
+      setMembers(sorted);
+      saveCachedMemberStats(sorted);
+      await AsyncStorage.setItem(LAST_SEEN_SUB_KEY, JSON.stringify(lastSeenSubId.current));
+    }
+
     if (showSpinner) setRefreshing(false);
   };
 
@@ -600,10 +694,16 @@ export default function App() {
 
     const nextList = sortList([...members, stats], sortBy);
     setMembers(nextList);
+    saveCachedMemberStats(nextList);
     setDrawerAddInput('');
+
     const usernames = nextList.map((m) => m.username);
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(usernames));
-    syncCloudTracking(usernames, pushToken);
+
+    if (user?.uid) {
+      updateTrackedMembers(user.uid, usernames);
+    }
+
     setDrawerOpen(false);
     Alert.alert('Added', `@${stats.username} joined the board!`);
   };
@@ -620,11 +720,16 @@ export default function App() {
     }
     const nextList = members.filter((m) => m.username !== username);
     setMembers(nextList);
+    saveCachedMemberStats(nextList);
     delete lastSeenSubId.current[username];
     await AsyncStorage.setItem(LAST_SEEN_SUB_KEY, JSON.stringify(lastSeenSubId.current));
+
     const usernames = nextList.map((m) => m.username);
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(usernames));
-    syncCloudTracking(usernames, pushToken);
+
+    if (user?.uid) {
+      updateTrackedMembers(user.uid, usernames);
+    }
   };
 
   const openLeetCodeProfile = (username: string) => {
@@ -691,6 +796,7 @@ export default function App() {
     return `${displayHour}:${displayMinute} ${period}`;
   };
 
+  // Splash overlay
   if (isSplashVisible) {
     return (
       <View style={[styles.splashFullOverlay, { backgroundColor: '#05070d' }]}>
@@ -719,45 +825,82 @@ export default function App() {
     );
   }
 
-  if (!ownerHandle) {
+  // Onboarding screen if no handle and not authenticated
+  if (!ownerHandle && !isAuthenticated) {
     return (
-      <SafeAreaProvider>
-        <SafeAreaView style={[styles.container, { backgroundColor: colors.bg, justifyContent: 'center', padding: 20 }]}>
-          <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
-          <View style={[styles.onboardingCard, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}>
-            <View style={[styles.onboardingIconRing, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
-              <Text style={{ fontSize: 30 }}>🔥</Text>
-            </View>
-            <Text style={[styles.onboardingBadge, { color: colors.primary }]}>GET STARTED</Text>
-            <Text style={[styles.onboardingTitle, { color: colors.textPrimary }]}>Connect Your Handle</Text>
-            <Text style={[styles.onboardingSub, { color: colors.textSecondary }]}>
-              Link your LeetCode profile to monitor team rankings and receive automated streak shields.
-            </Text>
-
-            <TextInput
-              style={[styles.onboardingInput, { backgroundColor: colors.inputBg, color: colors.textPrimary, borderColor: colors.borderLight }]}
-              placeholder="e.g. tour_leet"
-              placeholderTextColor={colors.textMuted}
-              value={onboardingInput}
-              onChangeText={setOnboardingInput}
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-
-            <TouchableOpacity
-              style={[styles.onboardingBtn, { backgroundColor: colors.primary }, onboardingLoading && { opacity: 0.7 }]}
-              onPress={handleOnboardingSubmit}
-              disabled={onboardingLoading}
-            >
-              {onboardingLoading ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <Text style={styles.onboardingBtnText}>Start Tracking ⚡</Text>
-              )}
-            </TouchableOpacity>
+      <SafeAreaView style={[styles.container, { backgroundColor: colors.bg, justifyContent: 'center', padding: 20 }]}>
+        <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
+        <View style={[styles.onboardingCard, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}>
+          <View style={[styles.onboardingIconRing, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
+            <Text style={{ fontSize: 30 }}>🔥</Text>
           </View>
-        </SafeAreaView>
-      </SafeAreaProvider>
+          <Text style={[styles.onboardingBadge, { color: colors.primary }]}>GET STARTED</Text>
+          <Text style={[styles.onboardingTitle, { color: colors.textPrimary }]}>Connect Your Handle</Text>
+          <Text style={[styles.onboardingSub, { color: colors.textSecondary }]}>
+            Link your LeetCode profile to monitor team rankings and receive automated streak shields.
+          </Text>
+
+          <TextInput
+            style={[styles.onboardingInput, { backgroundColor: colors.inputBg, color: colors.textPrimary, borderColor: colors.borderLight }]}
+            placeholder="e.g. tour_leet"
+            placeholderTextColor={colors.textMuted}
+            value={onboardingInput}
+            onChangeText={setOnboardingInput}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+
+          <TouchableOpacity
+            style={[styles.onboardingBtn, { backgroundColor: colors.primary }, onboardingLoading && { opacity: 0.7 }]}
+            onPress={handleOnboardingSubmit}
+            disabled={onboardingLoading}
+          >
+            {onboardingLoading ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.onboardingBtnText}>Start Tracking ⚡</Text>
+            )}
+          </TouchableOpacity>
+
+          {/* Secure Firebase Email/OTP Sign Up / Log In Option */}
+          <TouchableOpacity
+            style={[styles.authAltBtn, { borderColor: colors.border, backgroundColor: colors.subCardBg }]}
+            onPress={() => {
+              setAuthModalInitialMode('register');
+              setAuthModalVisible(true);
+            }}
+          >
+            <Text style={[styles.authAltBtnText, { color: colors.textPrimary }]}>
+              🔐 Sign Up with Unique Username & OTP
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={{ marginTop: 12 }}
+            onPress={() => {
+              setAuthModalInitialMode('login');
+              setAuthModalVisible(true);
+            }}
+          >
+            <Text style={{ color: colors.primary, fontSize: 13, fontWeight: '800' }}>
+              Already have an account? Sign In →
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Auth Modal */}
+        <AuthModal
+          visible={authModalVisible}
+          initialMode={authModalInitialMode}
+          onClose={() => setAuthModalVisible(false)}
+          onSuccess={(newHandle) => {
+            setOwnerHandle(newHandle);
+            ownerHandleRef.current = newHandle;
+          }}
+          colors={colors}
+          isDarkMode={isDarkMode}
+        />
+      </SafeAreaView>
     );
   }
 
@@ -769,434 +912,457 @@ export default function App() {
   const selectedDayTracks = getSubmissionsForDay(activeDay);
   const totalSelectedDayCount = selectedDayTracks.reduce((acc, curr) => acc + curr.filteredSubmissions.length, 0);
 
-  const ownerStats = members.find((m) => m.username.toLowerCase() === ownerHandle.toLowerCase());
+  const ownerStats = members.find((m) => m.username.toLowerCase() === (ownerHandle || '').toLowerCase());
 
+  // 7-day Activity Details Screen
   if (isTodayTrackScreenOpen) {
     return (
-      <SafeAreaProvider>
-        <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]}>
-          <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
+      <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]}>
+        <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
 
-          <View style={[styles.profileNavBar, { borderBottomColor: colors.border, backgroundColor: colors.bg }]}>
-            <TouchableOpacity
-              style={[styles.navBackBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
-              onPress={() => setIsTodayTrackScreenOpen(false)}
-              activeOpacity={0.7}
-            >
-              <Text style={[styles.navBackBtnText, { color: colors.textPrimary }]}>← Back</Text>
-            </TouchableOpacity>
+        <View style={[styles.profileNavBar, { borderBottomColor: colors.border, backgroundColor: colors.bg }]}>
+          <TouchableOpacity
+            style={[styles.navBackBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
+            onPress={() => setIsTodayTrackScreenOpen(false)}
+            activeOpacity={0.7}
+          >
+            <Text style={[styles.navBackBtnText, { color: colors.textPrimary }]}>← Back</Text>
+          </TouchableOpacity>
 
-            <View style={[styles.todayCountTag, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}>
-              <Text style={[styles.todayCountTagText, { color: colors.primary }]}>
-                ⚡ {totalSelectedDayCount} Solved ({activeDay.label})
-              </Text>
-            </View>
+          <View style={[styles.todayCountTag, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}>
+            <Text style={[styles.todayCountTagText, { color: colors.primary }]}>
+              ⚡ {totalSelectedDayCount} Solved ({activeDay.label})
+            </Text>
           </View>
+        </View>
 
-          {/* 7-Day Day Selector Carousel */}
-          <View style={{ marginTop: 12, marginBottom: 12 }}>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.dayPickerScroll}
-            >
-              {past7Days.map((day, idx) => {
-                const isSelected = selectedDayIndex === idx;
-                const daySolves = getSubmissionsForDay(day);
-                const daySolveTotal = daySolves.reduce((acc, curr) => acc + curr.filteredSubmissions.length, 0);
+        {/* 7-Day Day Selector Carousel */}
+        <View style={{ marginTop: 12, marginBottom: 12 }}>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.dayPickerScroll}
+          >
+            {past7Days.map((day, idx) => {
+              const isSelected = selectedDayIndex === idx;
+              const daySolves = getSubmissionsForDay(day);
+              const daySolveTotal = daySolves.reduce((acc, curr) => acc + curr.filteredSubmissions.length, 0);
 
-                return (
-                  <TouchableOpacity
-                    key={day.dateStr}
+              return (
+                <TouchableOpacity
+                  key={day.dateStr}
+                  style={[
+                    styles.dayPickerCard,
+                    { backgroundColor: colors.cardBg, borderColor: colors.border },
+                    isSelected && {
+                      backgroundColor: colors.primaryBg,
+                      borderColor: colors.primary,
+                    },
+                  ]}
+                  onPress={() => setSelectedDayIndex(idx)}
+                  activeOpacity={0.8}
+                >
+                  <Text
                     style={[
-                      styles.dayPickerCard,
-                      { backgroundColor: colors.cardBg, borderColor: colors.border },
-                      isSelected && {
-                        backgroundColor: colors.primaryBg,
-                        borderColor: colors.primary,
-                      },
+                      styles.dayPickerLabel,
+                      { color: colors.textSecondary },
+                      isSelected && { color: colors.primary, fontWeight: '900' },
                     ]}
-                    onPress={() => setSelectedDayIndex(idx)}
-                    activeOpacity={0.8}
+                  >
+                    {day.label}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.dayPickerSubLabel,
+                      { color: colors.textMuted },
+                      isSelected && { color: colors.textPrimary },
+                    ]}
+                  >
+                    {day.subLabel}
+                  </Text>
+                  <View
+                    style={[
+                      styles.dayPickerCountBadge,
+                      daySolveTotal > 0
+                        ? { backgroundColor: `${colors.green}20`, borderColor: colors.green }
+                        : { backgroundColor: colors.subCardBg, borderColor: colors.border },
+                      isSelected && daySolveTotal > 0 && { backgroundColor: colors.green },
+                    ]}
                   >
                     <Text
                       style={[
-                        styles.dayPickerLabel,
-                        { color: colors.textSecondary },
-                        isSelected && { color: colors.primary, fontWeight: '900' },
+                        styles.dayPickerCountText,
+                        { color: daySolveTotal > 0 ? colors.green : colors.textMuted },
+                        isSelected && daySolveTotal > 0 && { color: '#fff' },
                       ]}
                     >
-                      {day.label}
+                      {daySolveTotal > 0 ? `⚡ ${daySolveTotal}` : '0'}
                     </Text>
-                    <Text
-                      style={[
-                        styles.dayPickerSubLabel,
-                        { color: colors.textMuted },
-                        isSelected && { color: colors.textPrimary },
-                      ]}
-                    >
-                      {day.subLabel}
-                    </Text>
-                    <View
-                      style={[
-                        styles.dayPickerCountBadge,
-                        daySolveTotal > 0
-                          ? { backgroundColor: `${colors.green}20`, borderColor: colors.green }
-                          : { backgroundColor: colors.subCardBg, borderColor: colors.border },
-                        isSelected && daySolveTotal > 0 && { backgroundColor: colors.green },
-                      ]}
-                    >
-                      <Text
-                        style={[
-                          styles.dayPickerCountText,
-                          { color: daySolveTotal > 0 ? colors.green : colors.textMuted },
-                          isSelected && daySolveTotal > 0 && { color: '#fff' },
-                        ]}
-                      >
-                        {daySolveTotal > 0 ? `⚡ ${daySolveTotal}` : '0'}
-                      </Text>
-                    </View>
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-          </View>
-
-          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.profileScroll}>
-            {selectedDayTracks.map((person) => {
-              const count = person.filteredSubmissions.length;
-              const isCurrentOwner = ownerHandle && person.username.toLowerCase() === ownerHandle.toLowerCase();
-
-              return (
-                <View key={person.username} style={[styles.personTrackCard, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                  <View style={styles.personTrackHeader}>
-                    {person.avatar ? (
-                      <Image source={{ uri: person.avatar }} style={[styles.personTrackAvatar, { borderColor: colors.cyan }]} />
-                    ) : (
-                      <View style={[styles.personTrackAvatarFallback, { backgroundColor: colors.cyanBg, borderColor: colors.cyan }]}>
-                        <Text style={{ color: colors.cyan, fontSize: 13, fontWeight: '900' }}>
-                          {(person.realName || person.username).charAt(0).toUpperCase()}
-                        </Text>
-                      </View>
-                    )}
-
-                    <View style={{ flex: 1 }}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                        <Text style={[styles.personTrackName, { color: colors.textPrimary }]}>{person.realName || person.username}</Text>
-                        {isCurrentOwner && (
-                          <View style={[styles.ownerSmallBadge, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
-                            <Text style={[styles.ownerSmallBadgeText, { color: colors.primary }]}>You</Text>
-                          </View>
-                        )}
-                      </View>
-                      <Text style={[styles.personTrackHandle, { color: colors.textMuted }]}>@{person.username}</Text>
-                    </View>
-
-                    <View
-                      style={[
-                        styles.personSolvedCountBadge,
-                        count > 0
-                          ? { backgroundColor: '#10b98120', borderColor: '#10b981' }
-                          : { backgroundColor: colors.subCardBg, borderColor: colors.border },
-                      ]}
-                    >
-                      <Text
-                        style={[
-                          styles.personSolvedCountText,
-                          { color: count > 0 ? '#10b981' : colors.textMuted },
-                        ]}
-                      >
-                        {count > 0 ? `⚡ ${count} Solved` : '0 Solves'}
-                      </Text>
-                    </View>
                   </View>
-
-                  {count > 0 ? (
-                    <View style={{ marginTop: 12 }}>
-                      {person.filteredSubmissions.map((sub, idx) => {
-                        const diffMeta = getDifficultyMeta(sub.difficulty);
-
-                        return (
-                          <View
-                            key={idx}
-                            style={[styles.personSubRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
-                          >
-                            <View style={styles.recentCheckIcon}>
-                              <Text style={{ color: colors.green, fontWeight: '900', fontSize: 11 }}>✓</Text>
-                            </View>
-
-                            <View style={{ flex: 1, paddingRight: 8 }}>
-                              <View style={styles.inlineQuestionRow}>
-                                <View style={[styles.compactDiffBadge, { backgroundColor: `${diffMeta.color}20`, borderColor: `${diffMeta.color}60` }]}>
-                                  <Text style={[styles.compactDiffText, { color: diffMeta.color }]}>{diffMeta.letter}</Text>
-                                </View>
-                                <Text style={[styles.recentTitle, { color: colors.textPrimary }]}>
-                                  {sub.title}
-                                </Text>
-                              </View>
-                              <Text style={[styles.recentDate, { color: colors.textMuted }]}>Solved • {sub.timestamp}</Text>
-                            </View>
-
-                            <TouchableOpacity
-                              style={[styles.openBtnTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
-                              onPress={() => openProblemUrl(sub.title)}
-                              activeOpacity={0.7}
-                            >
-                              <Text style={[styles.openBtnText, { color: colors.cyan }]}>Open ↗</Text>
-                            </TouchableOpacity>
-                          </View>
-                        );
-                      })}
-                    </View>
-                  ) : (
-                    <View style={[styles.noSubPersonBox, { backgroundColor: colors.subCardBg }]}>
-                      <Text style={{ color: colors.textMuted, fontSize: 12 }}>
-                        No questions completed on this day.
-                      </Text>
-                    </View>
-                  )}
-                </View>
+                </TouchableOpacity>
               );
             })}
           </ScrollView>
-        </SafeAreaView>
-      </SafeAreaProvider>
+        </View>
+
+        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.profileScroll}>
+          {selectedDayTracks.map((person) => {
+            const count = person.filteredSubmissions.length;
+            const isCurrentOwner = ownerHandle && person.username.toLowerCase() === ownerHandle.toLowerCase();
+
+            return (
+              <View key={person.username} style={[styles.personTrackCard, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+                <View style={styles.personTrackHeader}>
+                  {person.avatar ? (
+                    <Image source={{ uri: person.avatar }} style={[styles.personTrackAvatar, { borderColor: colors.cyan }]} />
+                  ) : (
+                    <View style={[styles.personTrackAvatarFallback, { backgroundColor: colors.cyanBg, borderColor: colors.cyan }]}>
+                      <Text style={{ color: colors.cyan, fontSize: 13, fontWeight: '900' }}>
+                        {(person.realName || person.username).charAt(0).toUpperCase()}
+                      </Text>
+                    </View>
+                  )}
+
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={[styles.personTrackName, { color: colors.textPrimary }]}>{person.realName || person.username}</Text>
+                      {isCurrentOwner && (
+                        <View style={[styles.ownerSmallBadge, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
+                          <Text style={[styles.ownerSmallBadgeText, { color: colors.primary }]}>You</Text>
+                        </View>
+                      )}
+                    </View>
+                    <Text style={[styles.personTrackHandle, { color: colors.textMuted }]}>@{person.username}</Text>
+                  </View>
+
+                  <View
+                    style={[
+                      styles.personSolvedCountBadge,
+                      count > 0
+                        ? { backgroundColor: '#10b98120', borderColor: '#10b981' }
+                        : { backgroundColor: colors.subCardBg, borderColor: colors.border },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.personSolvedCountText,
+                        { color: count > 0 ? '#10b981' : colors.textMuted },
+                      ]}
+                    >
+                      {count > 0 ? `⚡ ${count} Solved` : '0 Solves'}
+                    </Text>
+                  </View>
+                </View>
+
+                {count > 0 ? (
+                  <View style={{ marginTop: 12 }}>
+                    {person.filteredSubmissions.map((sub, idx) => {
+                      const diffMeta = getDifficultyMeta(sub.difficulty);
+
+                      return (
+                        <View
+                          key={idx}
+                          style={[styles.personSubRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
+                        >
+                          <View style={styles.recentCheckIcon}>
+                            <Text style={{ color: colors.green, fontWeight: '900', fontSize: 11 }}>✓</Text>
+                          </View>
+
+                          <View style={{ flex: 1, paddingRight: 8 }}>
+                            <View style={styles.inlineQuestionRow}>
+                              <View style={[styles.compactDiffBadge, { backgroundColor: `${diffMeta.color}20`, borderColor: `${diffMeta.color}60` }]}>
+                                <Text style={[styles.compactDiffText, { color: diffMeta.color }]}>{diffMeta.letter}</Text>
+                              </View>
+                              <Text style={[styles.recentTitle, { color: colors.textPrimary }]}>
+                                {sub.title}
+                              </Text>
+                            </View>
+                            <Text style={[styles.recentDate, { color: colors.textMuted }]}>Solved • {sub.timestamp}</Text>
+                          </View>
+
+                          <TouchableOpacity
+                            style={[styles.openBtnTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
+                            onPress={() => openProblemUrl(sub.title)}
+                            activeOpacity={0.7}
+                          >
+                            <Text style={[styles.openBtnText, { color: colors.cyan }]}>Open ↗</Text>
+                          </TouchableOpacity>
+                        </View>
+                      );
+                    })}
+                  </View>
+                ) : (
+                  <View style={[styles.noSubPersonBox, { backgroundColor: colors.subCardBg }]}>
+                    <Text style={{ color: colors.textMuted, fontSize: 12 }}>
+                      No questions completed on this day.
+                    </Text>
+                  </View>
+                )}
+              </View>
+            );
+          })}
+        </ScrollView>
+      </SafeAreaView>
     );
   }
 
+  // Teammate Profile Viewer with 12-Month Calendar Heatmap
   if (selectedMember) {
     const isCurrentOwner = ownerHandle && selectedMember.username.toLowerCase() === ownerHandle.toLowerCase();
 
     return (
-      <SafeAreaProvider>
-        <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]}>
-          <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
+      <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]}>
+        <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
 
-          <View style={[styles.profileNavBar, { borderBottomColor: colors.border, backgroundColor: colors.bg }]}>
-            <TouchableOpacity
-              style={[styles.navBackBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
-              onPress={() => setSelectedMember(null)}
-              activeOpacity={0.7}
-            >
-              <Text style={[styles.navBackBtnText, { color: colors.textPrimary }]}>← Board</Text>
-            </TouchableOpacity>
+        <View style={[styles.profileNavBar, { borderBottomColor: colors.border, backgroundColor: colors.bg }]}>
+          <TouchableOpacity
+            style={[styles.navBackBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
+            onPress={() => setSelectedMember(null)}
+            activeOpacity={0.7}
+          >
+            <Text style={[styles.navBackBtnText, { color: colors.textPrimary }]}>← Board</Text>
+          </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[styles.externalLinkBtn, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}
-              onPress={() => openLeetCodeProfile(selectedMember.username)}
-              activeOpacity={0.7}
-            >
-              <Text style={[styles.externalLinkBtnText, { color: colors.primary }]}>🔗 Open Profile</Text>
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity
+            style={[styles.externalLinkBtn, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}
+            onPress={() => openLeetCodeProfile(selectedMember.username)}
+            activeOpacity={0.7}
+          >
+            <Text style={[styles.externalLinkBtnText, { color: colors.primary }]}>🔗 Open Profile</Text>
+          </TouchableOpacity>
+        </View>
 
-          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.profileScroll}>
-            <View style={[styles.profileCard, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              {selectedMember.avatar ? (
-                <Image
-                  source={{ uri: selectedMember.avatar }}
-                  style={[styles.profileAvatarImage, { borderColor: colors.primary }]}
-                />
-              ) : (
-                <View style={[styles.profileAvatar, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
-                  <Text style={[styles.profileAvatarText, { color: colors.primary }]}>
-                    {(selectedMember.realName || selectedMember.username).charAt(0).toUpperCase()}
+        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.profileScroll}>
+          <View style={[styles.profileCard, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+            {selectedMember.avatar ? (
+              <Image
+                source={{ uri: selectedMember.avatar }}
+                style={[styles.profileAvatarImage, { borderColor: colors.primary }]}
+              />
+            ) : (
+              <View style={[styles.profileAvatar, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
+                <Text style={[styles.profileAvatarText, { color: colors.primary }]}>
+                  {(selectedMember.realName || selectedMember.username).charAt(0).toUpperCase()}
+                </Text>
+              </View>
+            )}
+            <Text style={[styles.profileRealName, { color: colors.textPrimary }]}>{selectedMember.realName || selectedMember.username}</Text>
+            <Text style={[styles.profileHandle, { color: colors.textMuted }]}>@{selectedMember.username}</Text>
+
+            <View style={styles.pillRow}>
+              {isCurrentOwner && (
+                <View style={[styles.pillBadge, { borderColor: colors.primary, backgroundColor: colors.primaryBg }]}>
+                  <Text style={[styles.pillText, { color: colors.primary }]}>Primary Account</Text>
+                </View>
+              )}
+              {selectedMember.streak > 0 && (
+                <View style={[styles.pillBadge, { borderColor: colors.primaryBorder, backgroundColor: colors.primaryBg }]}>
+                  <Text style={[styles.pillText, { color: colors.primary }]}>
+                    🔥 {selectedMember.streak}d Streak
                   </Text>
                 </View>
               )}
-              <Text style={[styles.profileRealName, { color: colors.textPrimary }]}>{selectedMember.realName || selectedMember.username}</Text>
-              <Text style={[styles.profileHandle, { color: colors.textMuted }]}>@{selectedMember.username}</Text>
+            </View>
+          </View>
 
-              <View style={styles.pillRow}>
-                {isCurrentOwner && (
-                  <View style={[styles.pillBadge, { borderColor: colors.primary, backgroundColor: colors.primaryBg }]}>
-                    <Text style={[styles.pillText, { color: colors.primary }]}>Primary Account</Text>
-                  </View>
-                )}
-                {selectedMember.streak > 0 && (
-                  <View style={[styles.pillBadge, { borderColor: colors.primaryBorder, backgroundColor: colors.primaryBg }]}>
-                    <Text style={[styles.pillText, { color: colors.primary }]}>
-                      🔥 {selectedMember.streak}d Streak
-                    </Text>
-                  </View>
-                )}
+          <View style={styles.statsGrid}>
+            <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+              <Text style={[styles.gridVal, { color: colors.cyan }]}>
+                {selectedMember.contestRating > 0 ? selectedMember.contestRating : 'N/A'}
+              </Text>
+              <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Contest Rating</Text>
+            </View>
+            <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+              <Text style={[styles.gridVal, { color: colors.primary }]}>
+                {selectedMember.totalSolved}
+              </Text>
+              <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Total Solved</Text>
+            </View>
+            <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+              <Text style={[styles.gridVal, { color: colors.green }]}>
+                {selectedMember.acceptanceRate > 0 ? `${selectedMember.acceptanceRate}%` : 'N/A'}
+              </Text>
+              <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Accuracy</Text>
+            </View>
+          </View>
+
+          <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+            <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Problem Solved Breakdown</Text>
+            <View style={styles.difficultyContainer}>
+              <View style={[styles.diffItemBox, { borderColor: `${colors.green}40`, backgroundColor: `${colors.green}15` }]}>
+                <Text style={[styles.diffNumber, { color: colors.green }]}>{selectedMember.easySolved}</Text>
+                <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Easy</Text>
+              </View>
+
+              <View style={[styles.diffItemBox, { borderColor: `${colors.yellow}40`, backgroundColor: `${colors.yellow}15` }]}>
+                <Text style={[styles.diffNumber, { color: colors.yellow }]}>{selectedMember.mediumSolved}</Text>
+                <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Medium</Text>
+              </View>
+
+              <View style={[styles.diffItemBox, { borderColor: `${colors.red}40`, backgroundColor: `${colors.red}15` }]}>
+                <Text style={[styles.diffNumber, { color: colors.red }]}>{selectedMember.hardSolved}</Text>
+                <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Hard</Text>
               </View>
             </View>
+          </View>
 
-            <View style={styles.statsGrid}>
-              <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                <Text style={[styles.gridVal, { color: colors.cyan }]}>
-                  {selectedMember.contestRating > 0 ? selectedMember.contestRating : 'N/A'}
-                </Text>
-                <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Contest Rating</Text>
-              </View>
-              <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                <Text style={[styles.gridVal, { color: colors.primary }]}>
-                  {selectedMember.totalSolved}
-                </Text>
-                <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Total Solved</Text>
-              </View>
-              <View style={[styles.gridItem, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-                <Text style={[styles.gridVal, { color: colors.green }]}>
-                  {selectedMember.acceptanceRate > 0 ? `${selectedMember.acceptanceRate}%` : 'N/A'}
-                </Text>
-                <Text style={[styles.gridLbl, { color: colors.textMuted }]}>Accuracy</Text>
-              </View>
-            </View>
-
-            <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Problem Solved Breakdown</Text>
-              <View style={styles.difficultyContainer}>
-                <View style={[styles.diffItemBox, { borderColor: `${colors.green}40`, backgroundColor: `${colors.green}15` }]}>
-                  <Text style={[styles.diffNumber, { color: colors.green }]}>{selectedMember.easySolved}</Text>
-                  <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Easy</Text>
-                </View>
-
-                <View style={[styles.diffItemBox, { borderColor: `${colors.yellow}40`, backgroundColor: `${colors.yellow}15` }]}>
-                  <Text style={[styles.diffNumber, { color: colors.yellow }]}>{selectedMember.mediumSolved}</Text>
-                  <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Medium</Text>
-                </View>
-
-                <View style={[styles.diffItemBox, { borderColor: `${colors.red}40`, backgroundColor: `${colors.red}15` }]}>
-                  <Text style={[styles.diffNumber, { color: colors.red }]}>{selectedMember.hardSolved}</Text>
-                  <Text style={[styles.diffLabel, { color: colors.textSecondary }]}>Hard</Text>
-                </View>
-              </View>
-            </View>
-
-            {/* LeetCode Month-Separated Heatmap */}
-            <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              <View style={styles.heatmapHeaderRow}>
-                <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Submissions Heatmap</Text>
-                {selectedDayInfo && (
-                  <View style={[styles.tooltipBadge, { backgroundColor: colors.subCardBg, borderColor: colors.cyan }]}>
-                    <Text style={[styles.tooltipText, { color: colors.cyan }]}>
-                      {selectedDayInfo.count} solves on {selectedDayInfo.date}
-                    </Text>
-                  </View>
-                )}
-              </View>
-
-              <ScrollView
-                ref={heatmapScrollRef}
-                horizontal={true}
-                showsHorizontalScrollIndicator={true}
-                indicatorStyle={isDarkMode ? 'white' : 'black'}
-                onContentSizeChange={() => heatmapScrollRef.current?.scrollToEnd({ animated: false })}
-                contentContainerStyle={{ paddingRight: 20 }}
-                style={[styles.matrixScroll, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
-              >
-                <View style={styles.monthsContainerRow}>
-                  {(selectedMember.heatmapMonthGroups || []).map((monthGroup, mIdx) => (
-                    <View key={mIdx} style={styles.monthBlock}>
-                      <Text style={[styles.monthBlockLabel, { color: colors.textMuted }]}>
-                        {monthGroup.monthName}
-                      </Text>
-
-                      <View style={styles.monthWeeksRow}>
-                        {monthGroup.weeks.map((week, wIdx) => (
-                          <View key={wIdx} style={styles.weekColumn}>
-                            {week.days.map((day, dIdx) => (
-                              <TouchableOpacity
-                                key={day?.date || dIdx}
-                                activeOpacity={day ? 0.7 : 1}
-                                onPress={() => day && setSelectedDayInfo(day)}
-                                style={[
-                                  styles.leetCodeSquare,
-                                  {
-                                    backgroundColor: day
-                                      ? getLeetCodeMatrixSquareColor(day.level)
-                                      : 'transparent',
-                                    borderColor:
-                                      selectedDayInfo?.date === day?.date
-                                        ? colors.cyan
-                                        : day?.isToday
-                                        ? colors.primary
-                                        : day ? colors.border : 'transparent',
-                                    borderWidth: day?.isToday ? 1.5 : day ? 0.5 : 0,
-                                  },
-                                ]}
-                              />
-                            ))}
-                          </View>
-                        ))}
-                      </View>
-                    </View>
-                  ))}
-                </View>
-              </ScrollView>
-
-              <View style={styles.heatmapLegend}>
-                <Text style={[styles.legendText, { color: colors.textMuted }]}>Less</Text>
-                <View style={[styles.legendBox, { backgroundColor: isDarkMode ? '#1e293b' : '#e2e8f0', borderColor: colors.border, borderWidth: 1 }]} />
-                <View style={[styles.legendBox, { backgroundColor: isDarkMode ? '#064e3b' : '#a7f3d0' }]} />
-                <View style={[styles.legendBox, { backgroundColor: '#10b981' }]} />
-                <View style={[styles.legendBox, { backgroundColor: '#00f2fe' }]} />
-                <Text style={[styles.legendText, { color: colors.textMuted }]}>More</Text>
-              </View>
-            </View>
-
-            <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>DSA Focus Areas</Text>
-              <View style={styles.topicGrid}>
-                {selectedMember.topTopics.map((topic, idx) => (
-                  <View key={idx} style={[styles.topicBadge, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
-                    <Text style={[styles.topicName, { color: colors.textPrimary }]}>{topic.name}</Text>
-                    <Text style={[styles.topicCount, { color: colors.cyan }]}>{topic.solved} solved</Text>
-                  </View>
-                ))}
-              </View>
-            </View>
-
-            <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              <View style={styles.pastHeaderRow}>
-                <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Recent Submissions</Text>
-                <Text style={[styles.pastCountText, { color: colors.textMuted }]}>
-                  {selectedMember.recentSubmissions.length} public solves
-                </Text>
-              </View>
-
-              {selectedMember.recentSubmissions.length > 0 ? (
-                selectedMember.recentSubmissions.map((s, idx) => (
-                  <View
-                    key={idx}
-                    style={[styles.recentRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
-                  >
-                    <View style={styles.recentCheckIcon}>
-                      <Text style={{ color: colors.green, fontWeight: '800', fontSize: 13 }}>✓</Text>
-                    </View>
-                    <View style={{ flex: 1, paddingRight: 6 }}>
-                      <Text style={[styles.recentTitle, { color: colors.textPrimary }]}>{s.title}</Text>
-                      <Text style={[styles.recentDate, { color: colors.textMuted }]}>Solved on {s.timestamp}</Text>
-                    </View>
-                    <TouchableOpacity
-                      style={[styles.openBtnTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
-                      onPress={() => openProblemUrl(s.title)}
-                      activeOpacity={0.7}
-                    >
-                      <Text style={[styles.openBtnText, { color: colors.cyan }]}>Open ↗</Text>
-                    </TouchableOpacity>
-                  </View>
-                ))
-              ) : (
-                <View style={[styles.noSubBox, { backgroundColor: colors.subCardBg }]}>
-                  <Text style={{ color: colors.textMuted, fontSize: 13 }}>No recent public submissions found.</Text>
+          {/* LeetCode Month-Separated Heatmap */}
+          <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+            <View style={styles.heatmapHeaderRow}>
+              <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Submissions Heatmap</Text>
+              {selectedDayInfo && (
+                <View style={[styles.tooltipBadge, { backgroundColor: colors.subCardBg, borderColor: colors.cyan }]}>
+                  <Text style={[styles.tooltipText, { color: colors.cyan }]}>
+                    {selectedDayInfo.count} solves on {selectedDayInfo.date}
+                  </Text>
                 </View>
               )}
             </View>
-          </ScrollView>
-        </SafeAreaView>
-      </SafeAreaProvider>
+
+            <ScrollView
+              ref={heatmapScrollRef}
+              horizontal={true}
+              showsHorizontalScrollIndicator={true}
+              indicatorStyle={isDarkMode ? 'white' : 'black'}
+              onContentSizeChange={() => heatmapScrollRef.current?.scrollToEnd({ animated: false })}
+              contentContainerStyle={{ paddingRight: 20 }}
+              style={[styles.matrixScroll, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
+            >
+              <View style={styles.monthsContainerRow}>
+                {(selectedMember.heatmapMonthGroups || []).map((monthGroup, mIdx) => (
+                  <View key={mIdx} style={styles.monthBlock}>
+                    <Text style={[styles.monthBlockLabel, { color: colors.textMuted }]}>
+                      {monthGroup.monthName}
+                    </Text>
+
+                    <View style={styles.monthWeeksRow}>
+                      {monthGroup.weeks.map((week, wIdx) => (
+                        <View key={wIdx} style={styles.weekColumn}>
+                          {week.days.map((day, dIdx) => (
+                            <TouchableOpacity
+                              key={day?.date || dIdx}
+                              activeOpacity={day ? 0.7 : 1}
+                              onPress={() => day && setSelectedDayInfo(day)}
+                              style={[
+                                styles.leetCodeSquare,
+                                {
+                                  backgroundColor: day
+                                    ? getLeetCodeMatrixSquareColor(day.level)
+                                    : 'transparent',
+                                  borderColor:
+                                    selectedDayInfo?.date === day?.date
+                                      ? colors.cyan
+                                      : day?.isToday
+                                      ? colors.primary
+                                      : day ? colors.border : 'transparent',
+                                  borderWidth: day?.isToday ? 1.5 : day ? 0.5 : 0,
+                                },
+                              ]}
+                            />
+                          ))}
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                ))}
+              </View>
+            </ScrollView>
+
+            <View style={styles.heatmapLegend}>
+              <Text style={[styles.legendText, { color: colors.textMuted }]}>Less</Text>
+              <View style={[styles.legendBox, { backgroundColor: isDarkMode ? '#1e293b' : '#e2e8f0', borderColor: colors.border, borderWidth: 1 }]} />
+              <View style={[styles.legendBox, { backgroundColor: isDarkMode ? '#064e3b' : '#a7f3d0' }]} />
+              <View style={[styles.legendBox, { backgroundColor: '#10b981' }]} />
+              <View style={[styles.legendBox, { backgroundColor: '#00f2fe' }]} />
+              <Text style={[styles.legendText, { color: colors.textMuted }]}>More</Text>
+            </View>
+          </View>
+
+          <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+            <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>DSA Focus Areas</Text>
+            <View style={styles.topicGrid}>
+              {selectedMember.topTopics.map((topic, idx) => (
+                <View key={idx} style={[styles.topicBadge, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
+                  <Text style={[styles.topicName, { color: colors.textPrimary }]}>{topic.name}</Text>
+                  <Text style={[styles.topicCount, { color: colors.cyan }]}>{topic.solved} solved</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+
+          <View style={[styles.profileSection, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+            <View style={styles.pastHeaderRow}>
+              <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>Recent Submissions</Text>
+              <Text style={[styles.pastCountText, { color: colors.textMuted }]}>
+                {selectedMember.recentSubmissions.length} public solves
+              </Text>
+            </View>
+
+            {selectedMember.recentSubmissions.length > 0 ? (
+              selectedMember.recentSubmissions.map((s, idx) => (
+                <View
+                  key={idx}
+                  style={[styles.recentRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
+                >
+                  <View style={styles.recentCheckIcon}>
+                    <Text style={{ color: colors.green, fontWeight: '800', fontSize: 13 }}>✓</Text>
+                  </View>
+                  <View style={{ flex: 1, paddingRight: 6 }}>
+                    <Text style={[styles.recentTitle, { color: colors.textPrimary }]}>{s.title}</Text>
+                    <Text style={[styles.recentDate, { color: colors.textMuted }]}>Solved on {s.timestamp}</Text>
+                  </View>
+                  <TouchableOpacity
+                    style={[styles.openBtnTag, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
+                    onPress={() => openProblemUrl(s.title)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={[styles.openBtnText, { color: colors.cyan }]}>Open ↗</Text>
+                  </TouchableOpacity>
+                </View>
+              ))
+            ) : (
+              <View style={[styles.noSubBox, { backgroundColor: colors.subCardBg }]}>
+                <Text style={{ color: colors.textMuted, fontSize: 13 }}>No recent public submissions found.</Text>
+              </View>
+            )}
+          </View>
+        </ScrollView>
+      </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaProvider>
-      <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]}>
-        <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
+    <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]}>
+      <StatusBar barStyle={colors.statusBar} backgroundColor={colors.bg} />
 
-        {/* Top Navbar */}
-        <View style={styles.header}>
+      {/* Top in-app alert banner for real-time notification */}
+      {latestAlert && (
+        <TouchableOpacity
+          style={[styles.inAppToast, { backgroundColor: colors.primary }]}
+          onPress={() => {
+            clearLatestAlert();
+            setNotifModalVisible(true);
+          }}
+          activeOpacity={0.9}
+        >
+          <Text style={{ fontSize: 18 }}>🔔</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.inAppToastTitle} numberOfLines={1}>
+              {latestAlert.title}
+            </Text>
+            <Text style={styles.inAppToastMessage} numberOfLines={1}>
+              {latestAlert.message}
+            </Text>
+          </View>
+          <TouchableOpacity onPress={clearLatestAlert} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+            <Text style={{ color: '#fff', fontWeight: '900' }}>✕</Text>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      )}
+
+      {/* Top Navbar */}
+      <View style={styles.header}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
           <TouchableOpacity
             style={[styles.drawerBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
             onPress={() => setDrawerOpen(true)}
@@ -1205,461 +1371,654 @@ export default function App() {
             <Text style={[styles.drawerBtnIcon, { color: colors.primary }]}>☰</Text>
           </TouchableOpacity>
 
-          <View style={styles.headerRight}>
-            <TouchableOpacity
-              style={[styles.themeToggleBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
-              onPress={toggleTheme}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.themeToggleBtnText}>{isDarkMode ? '☀️' : '🌙'}</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[
-                styles.reminderHeaderBtn,
-                { backgroundColor: colors.cardBg, borderColor: colors.border },
-                reminderConfig.enabled && { borderColor: colors.primary, backgroundColor: colors.primaryBg },
-              ]}
-              onPress={() => setShowReminderModal(true)}
-            >
-              <Text style={[styles.reminderHeaderBtnText, { color: colors.textPrimary }]}>
-                ⏰ {reminderConfig.enabled ? formatReminderTime(reminderConfig.hour, reminderConfig.minute) : 'Off'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {/* Daily POTD Glowing Banner */}
-        {dailyProblem && (
+          {/* Real-Time Notifications Bell Button */}
           <TouchableOpacity
-            style={[styles.potdBanner, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}
-            activeOpacity={0.88}
-            onPress={() => openProblemUrl(dailyProblem.link)}
+            style={[styles.notifBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
+            onPress={() => setNotifModalVisible(true)}
+            activeOpacity={0.7}
           >
-            <View style={styles.potdHead}>
-              <View style={styles.potdTagWrapper}>
-                <Text style={styles.potdSparkle}>⚡</Text>
-                <Text style={[styles.potdTag, { color: colors.primary }]}>DAILY CHALLENGE</Text>
-              </View>
-              <View
-                style={[
-                  styles.potdDiffBadge,
-                  { backgroundColor: `${getDifficultyMeta(dailyProblem.difficulty).color}20`, borderColor: `${getDifficultyMeta(dailyProblem.difficulty).color}60` },
-                ]}
-              >
-                <Text style={[styles.potdDiffText, { color: getDifficultyMeta(dailyProblem.difficulty).color }]}>
-                  {dailyProblem.difficulty}
+            <Text style={{ fontSize: 15 }}>🔔</Text>
+            {unreadCount > 0 && (
+              <View style={[styles.notifBadgeCounter, { backgroundColor: colors.primary }]}>
+                <Text style={styles.notifBadgeText}>
+                  {unreadCount > 9 ? '9+' : unreadCount}
                 </Text>
               </View>
-            </View>
-            <Text style={[styles.potdTitle, { color: colors.textPrimary }]} numberOfLines={1}>
-              {dailyProblem.title}
-            </Text>
-            <View style={styles.potdFooter}>
-              <View style={styles.potdTopicsRow}>
-                {dailyProblem.topicTags.slice(0, 3).map((tag, idx) => (
-                  <View key={idx} style={[styles.potdTopicItem, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
-                    <Text style={[styles.potdTopicText, { color: colors.textSecondary }]}>{tag}</Text>
-                  </View>
-                ))}
-              </View>
-              <Text style={[styles.potdSolveText, { color: colors.cyan }]}>Solve Now ↗</Text>
-            </View>
-          </TouchableOpacity>
-        )}
-
-        {/* Dedicated Responsive Live Activity Banner */}
-        <TouchableOpacity
-          style={[styles.liveActivityBanner, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}
-          onPress={() => {
-            setSelectedDayIndex(0);
-            setIsTodayTrackScreenOpen(true);
-          }}
-          activeOpacity={0.8}
-        >
-          <View style={styles.liveActivityLeft}>
-            <View style={[styles.liveActivityIconRing, { backgroundColor: colors.primaryBg }]}>
-              <Text style={{ fontSize: 16 }}>🎯</Text>
-            </View>
-            <View>
-              <Text style={[styles.liveActivityTitle, { color: colors.textPrimary }]}>Live Team Activity</Text>
-              <Text style={[styles.liveActivitySub, { color: colors.textMuted }]}>Today & past 7 days records</Text>
-            </View>
-          </View>
-
-          <View style={[styles.liveActivityCountBadge, { backgroundColor: colors.primary }]}>
-            <Text style={styles.liveActivityCountText}>
-              {totalSolvesTodayCount} Solved Today
-            </Text>
-            <Text style={{ color: '#fff', fontSize: 11, fontWeight: '900' }}>↗</Text>
-          </View>
-        </TouchableOpacity>
-
-        {/* Search Field */}
-        {members.length > 0 && (
-          <View style={styles.searchRow}>
-            <TextInput
-              style={[styles.searchInput, { backgroundColor: colors.cardBg, color: colors.textPrimary, borderColor: colors.border }]}
-              placeholder="🔍 Search teammates by name or handle..."
-              placeholderTextColor={colors.textMuted}
-              value={searchQuery}
-              onChangeText={setSearchQuery}
-              autoCapitalize="none"
-            />
-          </View>
-        )}
-
-        {/* Sorting Tabs Full Screen Width */}
-        <View style={styles.filterTabs}>
-          <Text style={[styles.sortLabel, { color: colors.textMuted }]}>SORT</Text>
-          <TouchableOpacity
-            style={[styles.tab, { backgroundColor: colors.cardBg, borderColor: colors.border }, sortBy === 'solved' && { backgroundColor: colors.primary, borderColor: colors.primary }]}
-            onPress={() => handleSortChange('solved')}
-          >
-            <Text style={[styles.tabText, { color: colors.textSecondary }, sortBy === 'solved' && styles.activeTabText]}>Solved</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.tab, { backgroundColor: colors.cardBg, borderColor: colors.border }, sortBy === 'streak' && { backgroundColor: colors.primary, borderColor: colors.primary }]}
-            onPress={() => handleSortChange('streak')}
-          >
-            <Text style={[styles.tabText, { color: colors.textSecondary }, sortBy === 'streak' && styles.activeTabText]}>🔥 Streak</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.tab, { backgroundColor: colors.cardBg, borderColor: colors.border }, sortBy === 'acceptance' && { backgroundColor: colors.primary, borderColor: colors.primary }]}
-            onPress={() => handleSortChange('acceptance')}
-          >
-            <Text style={[styles.tabText, { color: colors.textSecondary }, sortBy === 'acceptance' && styles.activeTabText]}>Accuracy</Text>
+            )}
           </TouchableOpacity>
         </View>
 
-        {/* Team Leaderboard Cards */}
-        <FlatList
-          data={filteredMembers}
-          keyExtractor={(item) => item.username}
-          refreshing={refreshing}
-          onRefresh={() => refreshTeam(members.map((m) => m.username), true, true)}
-          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 30 }}
-          ListEmptyComponent={
-            <View style={styles.emptyState}>
-              <Text style={styles.emptyEmoji}>⚡</Text>
-              <Text style={[styles.emptyText, { color: colors.textMuted }]}>
-                {searchQuery ? 'No matching members found.' : 'No members on the board yet.\nTap ☰ to add teammates.'}
+        <View style={styles.headerRight}>
+          <TouchableOpacity
+            style={[styles.themeToggleBtn, { backgroundColor: colors.cardBg, borderColor: colors.border }]}
+            onPress={toggleTheme}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.themeToggleBtnText}>{isDarkMode ? '☀️' : '🌙'}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[
+              styles.reminderHeaderBtn,
+              { backgroundColor: colors.cardBg, borderColor: colors.border },
+              reminderConfig.enabled && { borderColor: colors.primary, backgroundColor: colors.primaryBg },
+            ]}
+            onPress={() => setShowReminderModal(true)}
+          >
+            <Text style={[styles.reminderHeaderBtnText, { color: colors.textPrimary }]}>
+              ⏰ {reminderConfig.enabled ? formatReminderTime(reminderConfig.hour, reminderConfig.minute) : 'Off'}
+            </Text>
+          </TouchableOpacity>
+
+          {/* User Account / Sign In Button */}
+          {isAuthenticated ? (
+            <TouchableOpacity
+              style={[styles.userNavBtn, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}
+              onPress={() => setUserProfileModalVisible(true)}
+              activeOpacity={0.7}
+            >
+              <Text style={[styles.userNavBtnText, { color: colors.primary }]}>
+                {profile?.displayName?.charAt(0).toUpperCase() || profile?.username?.charAt(0).toUpperCase() || '👤'}
+              </Text>
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              style={[styles.signInNavBtn, { backgroundColor: colors.primary }]}
+              onPress={() => {
+                setAuthModalInitialMode('login');
+                setAuthModalVisible(true);
+              }}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.signInNavBtnText}>Sign In</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
+      {/* Daily POTD Glowing Banner */}
+      {dailyProblem && (
+        <TouchableOpacity
+          style={[styles.potdBanner, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}
+          activeOpacity={0.88}
+          onPress={() => openProblemUrl(dailyProblem.link)}
+        >
+          <View style={styles.potdHead}>
+            <View style={styles.potdTagWrapper}>
+              <Text style={styles.potdSparkle}>⚡</Text>
+              <Text style={[styles.potdTag, { color: colors.primary }]}>DAILY CHALLENGE</Text>
+            </View>
+            <View
+              style={[
+                styles.potdDiffBadge,
+                { backgroundColor: `${getDifficultyMeta(dailyProblem.difficulty).color}20`, borderColor: `${getDifficultyMeta(dailyProblem.difficulty).color}60` },
+              ]}
+            >
+              <Text style={[styles.potdDiffText, { color: getDifficultyMeta(dailyProblem.difficulty).color }]}>
+                {dailyProblem.difficulty}
               </Text>
             </View>
-          }
-          renderItem={({ item, index }) => {
-            const total = item.totalSolved || 1;
-            const easyP = (item.easySolved / total) * 100;
-            const medP = (item.mediumSolved / total) * 100;
-            const hardP = (item.hardSolved / total) * 100;
-            const rankBadge = getRankBadgeDesign(index);
-            const isCurrentOwner = ownerHandle && item.username.toLowerCase() === ownerHandle.toLowerCase();
+          </View>
+          <Text style={[styles.potdTitle, { color: colors.textPrimary }]} numberOfLines={1}>
+            {dailyProblem.title}
+          </Text>
+          <View style={styles.potdFooter}>
+            <View style={styles.potdTopicsRow}>
+              {dailyProblem.topicTags.slice(0, 3).map((tag, idx) => (
+                <View key={idx} style={[styles.potdTopicItem, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
+                  <Text style={[styles.potdTopicText, { color: colors.textSecondary }]}>{tag}</Text>
+                </View>
+              ))}
+            </View>
+            <Text style={[styles.potdSolveText, { color: colors.cyan }]}>Solve Now ↗</Text>
+          </View>
+        </TouchableOpacity>
+      )}
 
-            return (
-              <TouchableOpacity
-                activeOpacity={0.88}
-                onPress={() => {
-                  setSelectedDayInfo(null);
-                  setSelectedMember(item);
-                }}
-                style={[
-                  styles.card,
-                  { backgroundColor: colors.cardBg, borderColor: colors.border },
-                  index === 0 && { borderColor: '#ff990080' },
-                ]}
-              >
-                <View style={styles.cardHead}>
-                  <View style={styles.rankInfo}>
-                    <View style={[styles.podiumBadge, { backgroundColor: rankBadge.bg, borderColor: rankBadge.border }]}>
-                      <Text style={[styles.podiumText, { color: rankBadge.text }]}>{rankBadge.label}</Text>
-                    </View>
+      {/* Dedicated Responsive Live Activity Banner */}
+      <TouchableOpacity
+        style={[styles.liveActivityBanner, { backgroundColor: colors.cardBg, borderColor: colors.primaryBorder }]}
+        onPress={() => {
+          setSelectedDayIndex(0);
+          setIsTodayTrackScreenOpen(true);
+        }}
+        activeOpacity={0.8}
+      >
+        <View style={styles.liveActivityLeft}>
+          <View style={[styles.liveActivityIconRing, { backgroundColor: colors.primaryBg }]}>
+            <Text style={{ fontSize: 16 }}>🎯</Text>
+          </View>
+          <View>
+            <Text style={[styles.liveActivityTitle, { color: colors.textPrimary }]}>Live Team Activity</Text>
+            <Text style={[styles.liveActivitySub, { color: colors.textMuted }]}>Today & past 7 days records</Text>
+          </View>
+        </View>
 
-                    {item.avatar ? (
-                      <Image source={{ uri: item.avatar }} style={[styles.cardAvatarImage, { borderColor: colors.cyan }]} />
-                    ) : (
-                      <View style={[styles.cardAvatarFallback, { backgroundColor: colors.subCardBg, borderColor: colors.borderLight }]}>
-                        <Text style={[styles.cardAvatarText, { color: colors.textSecondary }]}>
-                          {(item.realName || item.username).charAt(0).toUpperCase()}
-                        </Text>
-                      </View>
-                    )}
+        <View style={[styles.liveActivityCountBadge, { backgroundColor: colors.primary }]}>
+          <Text style={styles.liveActivityCountText}>
+            {totalSolvesTodayCount} Solved Today
+          </Text>
+          <Text style={{ color: '#fff', fontSize: 11, fontWeight: '900' }}>↗</Text>
+        </View>
+      </TouchableOpacity>
 
-                    <View style={{ flex: 1 }}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                        <Text style={[styles.cardName, { color: colors.textPrimary }]}>{item.realName || item.username}</Text>
+      {/* Search Field */}
+      {members.length > 0 && (
+        <View style={styles.searchRow}>
+          <TextInput
+            style={[styles.searchInput, { backgroundColor: colors.cardBg, color: colors.textPrimary, borderColor: colors.border }]}
+            placeholder="🔍 Search teammates by name or handle..."
+            placeholderTextColor={colors.textMuted}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            autoCapitalize="none"
+          />
+        </View>
+      )}
 
-                        {isCurrentOwner && (
-                          <View style={[styles.ownerBadge, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
-                            <Text style={[styles.ownerBadgeText, { color: colors.primary }]}>You</Text>
-                          </View>
-                        )}
+      {/* Sorting Tabs Full Screen Width */}
+      <View style={styles.filterTabs}>
+        <Text style={[styles.sortLabel, { color: colors.textMuted }]}>SORT</Text>
+        <TouchableOpacity
+          style={[styles.tab, { backgroundColor: colors.cardBg, borderColor: colors.border }, sortBy === 'solved' && { backgroundColor: colors.primary, borderColor: colors.primary }]}
+          onPress={() => handleSortChange('solved')}
+        >
+          <Text style={[styles.tabText, { color: colors.textSecondary }, sortBy === 'solved' && styles.activeTabText]}>Solved</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tab, { backgroundColor: colors.cardBg, borderColor: colors.border }, sortBy === 'streak' && { backgroundColor: colors.primary, borderColor: colors.primary }]}
+          onPress={() => handleSortChange('streak')}
+        >
+          <Text style={[styles.tabText, { color: colors.textSecondary }, sortBy === 'streak' && styles.activeTabText]}>🔥 Streak</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tab, { backgroundColor: colors.cardBg, borderColor: colors.border }, sortBy === 'acceptance' && { backgroundColor: colors.primary, borderColor: colors.primary }]}
+          onPress={() => handleSortChange('acceptance')}
+        >
+          <Text style={[styles.tabText, { color: colors.textSecondary }, sortBy === 'acceptance' && styles.activeTabText]}>Accuracy</Text>
+        </TouchableOpacity>
+      </View>
 
-                        {item.streak > 0 && (
-                          <View style={[styles.streakBadge, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}>
-                            <Text style={[styles.streakText, { color: colors.primary }]}>🔥 {item.streak}d</Text>
-                          </View>
-                        )}
-                      </View>
-                      <Text style={[styles.cardHandle, { color: colors.textMuted }]}>@{item.username}</Text>
-                    </View>
+      {/* Team Leaderboard Cards */}
+      <FlatList
+        data={filteredMembers}
+        keyExtractor={(item) => item.username}
+        refreshing={refreshing}
+        onRefresh={() => refreshTeam(members.map((m) => m.username), true, true)}
+        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 30 }}
+        ListEmptyComponent={
+          <View style={styles.emptyState}>
+            <Text style={styles.emptyEmoji}>⚡</Text>
+            <Text style={[styles.emptyText, { color: colors.textMuted }]}>
+              {searchQuery ? 'No matching members found.' : 'No members on the board yet.\nTap ☰ to add teammates.'}
+            </Text>
+          </View>
+        }
+        renderItem={({ item, index }) => {
+          const total = item.totalSolved || 1;
+          const easyP = (item.easySolved / total) * 100;
+          const medP = (item.mediumSolved / total) * 100;
+          const hardP = (item.hardSolved / total) * 100;
+          const rankBadge = getRankBadgeDesign(index);
+          const isCurrentOwner = ownerHandle && item.username.toLowerCase() === ownerHandle.toLowerCase();
+
+          return (
+            <TouchableOpacity
+              activeOpacity={0.88}
+              onPress={() => {
+                setSelectedDayInfo(null);
+                setSelectedMember(item);
+              }}
+              style={[
+                styles.card,
+                { backgroundColor: colors.cardBg, borderColor: colors.border },
+                index === 0 && { borderColor: '#ff990080' },
+              ]}
+            >
+              <View style={styles.cardHead}>
+                <View style={styles.rankInfo}>
+                  <View style={[styles.podiumBadge, { backgroundColor: rankBadge.bg, borderColor: rankBadge.border }]}>
+                    <Text style={[styles.podiumText, { color: rankBadge.text }]}>{rankBadge.label}</Text>
                   </View>
-                  {!isCurrentOwner && (
-                    <TouchableOpacity onPress={() => removeMember(item.username)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-                      <Text style={[styles.delText, { color: colors.textMuted }]}>✕</Text>
-                    </TouchableOpacity>
+
+                  {item.avatar ? (
+                    <Image source={{ uri: item.avatar }} style={[styles.cardAvatarImage, { borderColor: colors.cyan }]} />
+                  ) : (
+                    <View style={[styles.cardAvatarFallback, { backgroundColor: colors.subCardBg, borderColor: colors.borderLight }]}>
+                      <Text style={[styles.cardAvatarText, { color: colors.textSecondary }]}>
+                        {(item.realName || item.username).charAt(0).toUpperCase()}
+                      </Text>
+                    </View>
                   )}
+
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                      <Text style={[styles.cardName, { color: colors.textPrimary }]}>{item.realName || item.username}</Text>
+
+                      {isCurrentOwner && (
+                        <View style={[styles.ownerBadge, { backgroundColor: colors.primaryBg, borderColor: colors.primary }]}>
+                          <Text style={[styles.ownerBadgeText, { color: colors.primary }]}>You</Text>
+                        </View>
+                      )}
+
+                      {item.streak > 0 && (
+                        <View style={[styles.streakBadge, { backgroundColor: colors.primaryBg, borderColor: colors.primaryBorder }]}>
+                          <Text style={[styles.streakText, { color: colors.primary }]}>🔥 {item.streak}d</Text>
+                        </View>
+                      )}
+                    </View>
+                    <Text style={[styles.cardHandle, { color: colors.textMuted }]}>@{item.username}</Text>
+                  </View>
+                </View>
+                {!isCurrentOwner && (
+                  <TouchableOpacity onPress={() => removeMember(item.username)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                    <Text style={[styles.delText, { color: colors.textMuted }]}>✕</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+
+              <View style={[styles.bar, { backgroundColor: colors.subCardBg }]}>
+                <View style={[styles.seg, { width: `${easyP}%`, backgroundColor: colors.green }]} />
+                <View style={[styles.seg, { width: `${medP}%`, backgroundColor: colors.yellow }]} />
+                <View style={[styles.seg, { width: `${hardP}%`, backgroundColor: colors.red }]} />
+              </View>
+
+              <View style={styles.statsFlex}>
+                <View style={styles.totalBox}>
+                  <Text style={[styles.totalText, { color: colors.textPrimary }]}>{item.totalSolved}</Text>
+                  <Text style={[styles.subLabel, { color: colors.textMuted }]}>Solved</Text>
                 </View>
 
-                <View style={[styles.bar, { backgroundColor: colors.subCardBg }]}>
-                  <View style={[styles.seg, { width: `${easyP}%`, backgroundColor: colors.green }]} />
-                  <View style={[styles.seg, { width: `${medP}%`, backgroundColor: colors.yellow }]} />
-                  <View style={[styles.seg, { width: `${hardP}%`, backgroundColor: colors.red }]} />
-                </View>
-
-                <View style={styles.statsFlex}>
-                  <View style={styles.totalBox}>
-                    <Text style={[styles.totalText, { color: colors.textPrimary }]}>{item.totalSolved}</Text>
-                    <Text style={[styles.subLabel, { color: colors.textMuted }]}>Solved</Text>
+                <View style={styles.badges}>
+                  <View style={[styles.badgeItem, { backgroundColor: `${colors.green}18`, borderColor: `${colors.green}40` }]}>
+                    <Text style={[styles.badgeVal, { color: colors.green }]}>{item.easySolved}</Text>
+                    <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Easy</Text>
+                  </View>
+                  <View style={[styles.badgeItem, { backgroundColor: `${colors.yellow}18`, borderColor: `${colors.yellow}40` }]}>
+                    <Text style={[styles.badgeVal, { color: colors.yellow }]}>{item.mediumSolved}</Text>
+                    <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Med</Text>
+                  </View>
+                  <View style={[styles.badgeItem, { backgroundColor: `${colors.red}18`, borderColor: `${colors.red}40` }]}>
+                    <Text style={[styles.badgeVal, { color: colors.red }]}>{item.hardSolved}</Text>
+                    <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Hard</Text>
                   </View>
 
-                  <View style={styles.badges}>
-                    <View style={[styles.badgeItem, { backgroundColor: `${colors.green}18`, borderColor: `${colors.green}40` }]}>
-                      <Text style={[styles.badgeVal, { color: colors.green }]}>{item.easySolved}</Text>
-                      <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Easy</Text>
-                    </View>
-                    <View style={[styles.badgeItem, { backgroundColor: `${colors.yellow}18`, borderColor: `${colors.yellow}40` }]}>
-                      <Text style={[styles.badgeVal, { color: colors.yellow }]}>{item.mediumSolved}</Text>
-                      <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Med</Text>
-                    </View>
-                    <View style={[styles.badgeItem, { backgroundColor: `${colors.red}18`, borderColor: `${colors.red}40` }]}>
-                      <Text style={[styles.badgeVal, { color: colors.red }]}>{item.hardSolved}</Text>
-                      <Text style={[styles.badgeDiff, { color: colors.textSecondary }]}>Hard</Text>
-                    </View>
-
-                    <View
+                  <View
+                    style={[
+                      styles.badgeItem,
+                      item.solvedDailyToday
+                        ? { backgroundColor: `${colors.green}20`, borderColor: `${colors.green}60` }
+                        : { backgroundColor: colors.subCardBg, borderColor: colors.border },
+                    ]}
+                  >
+                    <Text
                       style={[
-                        styles.badgeItem,
-                        item.solvedDailyToday
-                          ? { backgroundColor: `${colors.green}20`, borderColor: `${colors.green}60` }
-                          : { backgroundColor: colors.subCardBg, borderColor: colors.border },
+                        styles.badgeVal,
+                        { color: item.solvedDailyToday ? colors.green : colors.textMuted },
                       ]}
                     >
-                      <Text
-                        style={[
-                          styles.badgeVal,
-                          { color: item.solvedDailyToday ? colors.green : colors.textMuted },
-                        ]}
-                      >
-                        {item.solvedDailyToday ? '✓' : '⏳'}
-                      </Text>
-                      <Text
-                        style={[
-                          styles.badgeDiff,
-                          { color: item.solvedDailyToday ? colors.green : colors.textMuted, fontWeight: '800' },
-                        ]}
-                      >
-                        POTD
-                      </Text>
-                    </View>
+                      {item.solvedDailyToday ? '✓' : '⏳'}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.badgeDiff,
+                        { color: item.solvedDailyToday ? colors.green : colors.textMuted, fontWeight: '800' },
+                      ]}
+                    >
+                      POTD
+                    </Text>
                   </View>
                 </View>
-              </TouchableOpacity>
-            );
-          }}
-        />
-
-        {/* Option Drawer Sheet */}
-        <Modal
-          visible={drawerOpen}
-          transparent={true}
-          animationType="fade"
-          onRequestClose={() => setDrawerOpen(false)}
-        >
-          <View style={styles.modalShade}>
-            <View style={[styles.sheet, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              <View style={styles.modalHead}>
-                <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>Settings & Team</Text>
-                <TouchableOpacity onPress={() => setDrawerOpen(false)} style={[styles.sheetClose, { backgroundColor: colors.subCardBg }]}>
-                  <Text style={[styles.sheetCloseText, { color: colors.textSecondary }]}>✕</Text>
-                </TouchableOpacity>
               </View>
+            </TouchableOpacity>
+          );
+        }}
+      />
 
-              {ownerStats && (
-                <TouchableOpacity
-                  style={[styles.drawerProfileBtn, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
-                  onPress={() => {
-                    setDrawerOpen(false);
-                    setSelectedDayInfo(null);
-                    setSelectedMember(ownerStats);
-                  }}
-                >
-                  {ownerStats.avatar ? (
-                    <Image source={{ uri: ownerStats.avatar }} style={styles.drawerAvatar} />
-                  ) : (
-                    <View style={[styles.drawerAvatarFallback, { backgroundColor: colors.primaryBg }]}>
-                      <Text style={{ color: colors.primary, fontWeight: '900' }}>
-                        {(ownerStats.realName || ownerStats.username).charAt(0).toUpperCase()}
-                      </Text>
-                    </View>
-                  )}
-                  <View style={{ flex: 1 }}>
-                    <Text style={[styles.drawerProfileName, { color: colors.textPrimary }]}>
-                      {ownerStats.realName || ownerStats.username}
-                    </Text>
-                    <Text style={[styles.drawerProfileHandle, { color: colors.textMuted }]}>
-                      @{ownerStats.username} (You)
+      {/* Option Drawer Sheet */}
+      <Modal
+        visible={drawerOpen}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setDrawerOpen(false)}
+      >
+        <View style={styles.modalShade}>
+          <View style={[styles.sheet, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+            <View style={styles.modalHead}>
+              <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>Settings & Team</Text>
+              <TouchableOpacity onPress={() => setDrawerOpen(false)} style={[styles.sheetClose, { backgroundColor: colors.subCardBg }]}>
+                <Text style={[styles.sheetCloseText, { color: colors.textSecondary }]}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            {ownerStats && (
+              <TouchableOpacity
+                style={[styles.drawerProfileBtn, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
+                onPress={() => {
+                  setDrawerOpen(false);
+                  setSelectedDayInfo(null);
+                  setSelectedMember(ownerStats);
+                }}
+              >
+                {ownerStats.avatar ? (
+                  <Image source={{ uri: ownerStats.avatar }} style={styles.drawerAvatar} />
+                ) : (
+                  <View style={[styles.drawerAvatarFallback, { backgroundColor: colors.primaryBg }]}>
+                    <Text style={{ color: colors.primary, fontWeight: '900' }}>
+                      {(ownerStats.realName || ownerStats.username).charAt(0).toUpperCase()}
                     </Text>
                   </View>
-                  <Text style={{ color: colors.primary, fontWeight: '800', fontSize: 12 }}>View Profile →</Text>
-                </TouchableOpacity>
-              )}
+                )}
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.drawerProfileName, { color: colors.textPrimary }]}>
+                    {ownerStats.realName || ownerStats.username}
+                  </Text>
+                  <Text style={[styles.drawerProfileHandle, { color: colors.textMuted }]}>
+                    @{ownerStats.username} (You)
+                  </Text>
+                </View>
+                <Text style={{ color: colors.primary, fontWeight: '800', fontSize: 12 }}>View Profile →</Text>
+              </TouchableOpacity>
+            )}
 
-              <Text style={[styles.sheetSub, { color: colors.textPrimary, marginTop: 16, marginBottom: 8 }]}>
-                Add Teammate
-              </Text>
-              <View style={styles.drawerAddRow}>
-                <TextInput
-                  style={[styles.drawerInput, { backgroundColor: colors.subCardBg, color: colors.textPrimary, borderColor: colors.border }]}
-                  placeholder="LeetCode username..."
-                  placeholderTextColor={colors.textMuted}
-                  value={drawerAddInput}
-                  onChangeText={setDrawerAddInput}
-                  autoCapitalize="none"
-                />
-                <TouchableOpacity
-                  style={[styles.drawerAddBtn, { backgroundColor: colors.primary }, loading && { opacity: 0.6 }]}
-                  onPress={handleAddTeammate}
-                  disabled={loading}
-                >
-                  {loading ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.drawerAddBtnText}>+ Add</Text>}
-                </TouchableOpacity>
-              </View>
+            <Text style={[styles.sheetSub, { color: colors.textPrimary, marginTop: 16, marginBottom: 8 }]}>
+              Add Teammate
+            </Text>
+            <View style={styles.drawerAddRow}>
+              <TextInput
+                style={[styles.drawerInput, { backgroundColor: colors.subCardBg, color: colors.textPrimary, borderColor: colors.border }]}
+                placeholder="LeetCode username..."
+                placeholderTextColor={colors.textMuted}
+                value={drawerAddInput}
+                onChangeText={setDrawerAddInput}
+                autoCapitalize="none"
+              />
+              <TouchableOpacity
+                style={[styles.drawerAddBtn, { backgroundColor: colors.primary }, loading && { opacity: 0.6 }]}
+                onPress={handleAddTeammate}
+                disabled={loading}
+              >
+                {loading ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.drawerAddBtnText}>+ Add</Text>}
+              </TouchableOpacity>
+            </View>
 
+            {isAuthenticated ? (
               <TouchableOpacity
                 style={styles.signOutBtn}
-                onPress={handleSignOut}
+                onPress={handleSignOutAction}
                 activeOpacity={0.7}
               >
                 <Text style={styles.signOutBtnText}>🚪 Sign Out</Text>
               </TouchableOpacity>
-            </View>
-          </View>
-        </Modal>
-
-        {/* Custom Daily Streak Shield Reminder Modal */}
-        <Modal
-          visible={showReminderModal}
-          transparent={true}
-          animationType="fade"
-          onRequestClose={() => setShowReminderModal(false)}
-        >
-          <View style={styles.modalShade}>
-            <View style={[styles.sheet, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
-              <View style={styles.modalHead}>
-                <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>Daily Streak Shield</Text>
-                <TouchableOpacity onPress={() => setShowReminderModal(false)} style={[styles.sheetClose, { backgroundColor: colors.subCardBg }]}>
-                  <Text style={[styles.sheetCloseText, { color: colors.textSecondary }]}>✕</Text>
-                </TouchableOpacity>
-              </View>
-              <Text style={{ color: colors.textSecondary, fontSize: 13, marginBottom: 14, lineHeight: 18 }}>
-                Monitors <Text style={{ color: colors.primary, fontWeight: '800' }}>@{ownerHandle}</Text>. Alerts trigger only if your daily problem is unsolved.
-              </Text>
-
-              <View style={[styles.toggleRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
-                <Text style={[styles.toggleLabel, { color: colors.textPrimary }]}>Enable Daily Reminder</Text>
-                <Switch
-                  value={reminderConfig.enabled}
-                  onValueChange={(val) => saveReminderSettings({ ...reminderConfig, enabled: val })}
-                  trackColor={{ false: colors.border, true: colors.primary }}
-                  thumbColor="#fff"
-                />
-              </View>
-
-              <Text style={[styles.sheetSub, { color: colors.textPrimary, marginTop: 14, marginBottom: 8 }]}>Custom Time</Text>
-              <View style={[styles.customTimePickerRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
-                <View style={styles.timeInputContainer}>
-                  <TextInput
-                    style={[styles.timeDigitInput, { backgroundColor: colors.cardBg, color: colors.textPrimary, borderColor: colors.borderLight }]}
-                    keyboardType="number-pad"
-                    maxLength={2}
-                    value={customHour}
-                    onChangeText={setCustomHour}
-                    placeholder="08"
-                    placeholderTextColor={colors.textMuted}
-                  />
-                  <Text style={[styles.timeInputSub, { color: colors.textMuted }]}>Hour (1-12)</Text>
-                </View>
-
-                <Text style={[styles.timeColon, { color: colors.primary }]}>:</Text>
-
-                <View style={styles.timeInputContainer}>
-                  <TextInput
-                    style={[styles.timeDigitInput, { backgroundColor: colors.cardBg, color: colors.textPrimary, borderColor: colors.borderLight }]}
-                    keyboardType="number-pad"
-                    maxLength={2}
-                    value={customMinute}
-                    onChangeText={setCustomMinute}
-                    placeholder="00"
-                    placeholderTextColor={colors.textMuted}
-                  />
-                  <Text style={[styles.timeInputSub, { color: colors.textMuted }]}>Min (00-59)</Text>
-                </View>
-
-                <View style={styles.amPmContainer}>
-                  <TouchableOpacity
-                    style={[styles.amPmBtn, { backgroundColor: colors.cardBg, borderColor: colors.borderLight }, !isPM && { backgroundColor: colors.primary, borderColor: colors.primary }]}
-                    onPress={() => setIsPM(false)}
-                  >
-                    <Text style={[styles.amPmText, { color: !isPM ? '#fff' : colors.textSecondary }]}>AM</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.amPmBtn, { backgroundColor: colors.cardBg, borderColor: colors.borderLight }, isPM && { backgroundColor: colors.primary, borderColor: colors.primary }]}
-                    onPress={() => setIsPM(true)}
-                  >
-                    <Text style={[styles.amPmText, { color: isPM ? '#fff' : colors.textSecondary }]}>PM</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-
-              <Text style={[styles.sheetSub, { color: colors.textPrimary, marginTop: 14, marginBottom: 8 }]}>Presets</Text>
-              <View style={styles.timeSlotRow}>
-                {[
-                  { label: '6:00 PM', h: '06', m: '00', pm: true },
-                  { label: '8:00 PM', h: '08', m: '00', pm: true },
-                  { label: '9:30 PM', h: '09', m: '30', pm: true },
-                  { label: '11:00 PM', h: '11', m: '00', pm: true },
-                ].map((slot, idx) => (
-                  <TouchableOpacity
-                    key={idx}
-                    style={[styles.timeSlotBtn, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
-                    onPress={() => {
-                      setCustomHour(slot.h);
-                      setCustomMinute(slot.m);
-                      setIsPM(slot.pm);
-                    }}
-                  >
-                    <Text style={[styles.timeSlotText, { color: colors.textSecondary }]}>{slot.label}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-
+            ) : (
               <TouchableOpacity
-                style={[styles.actionMainBtn, { backgroundColor: colors.primary }]}
-                onPress={handleApplyCustomTime}
+                style={[styles.actionMainBtn, { backgroundColor: colors.primary, marginTop: 14 }]}
+                onPress={() => {
+                  setDrawerOpen(false);
+                  setAuthModalInitialMode('login');
+                  setAuthModalVisible(true);
+                }}
               >
-                <Text style={styles.actionMainBtnText}>Save Custom Reminder</Text>
+                <Text style={styles.actionMainBtnText}>🔐 Sign In / Create Account</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      {/* Custom Daily Streak Shield Reminder Modal */}
+      <Modal
+        visible={showReminderModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowReminderModal(false)}
+      >
+        <View style={styles.modalShade}>
+          <View style={[styles.sheet, { backgroundColor: colors.cardBg, borderColor: colors.border }]}>
+            <View style={styles.modalHead}>
+              <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>Daily Streak Shield</Text>
+              <TouchableOpacity onPress={() => setShowReminderModal(false)} style={[styles.sheetClose, { backgroundColor: colors.subCardBg }]}>
+                <Text style={[styles.sheetCloseText, { color: colors.textSecondary }]}>✕</Text>
               </TouchableOpacity>
             </View>
+            <Text style={{ color: colors.textSecondary, fontSize: 13, marginBottom: 14, lineHeight: 18 }}>
+              Monitors <Text style={{ color: colors.primary, fontWeight: '800' }}>@{ownerHandle}</Text>. Alerts trigger only if your daily problem is unsolved.
+            </Text>
+
+            <View style={[styles.toggleRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
+              <Text style={[styles.toggleLabel, { color: colors.textPrimary }]}>Enable Daily Reminder</Text>
+              <Switch
+                value={reminderConfig.enabled}
+                onValueChange={(val) => saveReminderSettings({ ...reminderConfig, enabled: val })}
+                trackColor={{ false: colors.border, true: colors.primary }}
+                thumbColor="#fff"
+              />
+            </View>
+
+            <Text style={[styles.sheetSub, { color: colors.textPrimary, marginTop: 14, marginBottom: 8 }]}>Custom Time</Text>
+            <View style={[styles.customTimePickerRow, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}>
+              <View style={styles.timeInputContainer}>
+                <TextInput
+                  style={[styles.timeDigitInput, { backgroundColor: colors.cardBg, color: colors.textPrimary, borderColor: colors.borderLight }]}
+                  keyboardType="number-pad"
+                  maxLength={2}
+                  value={customHour}
+                  onChangeText={setCustomHour}
+                  placeholder="08"
+                  placeholderTextColor={colors.textMuted}
+                />
+                <Text style={[styles.timeInputSub, { color: colors.textMuted }]}>Hour (1-12)</Text>
+              </View>
+
+              <Text style={[styles.timeColon, { color: colors.primary }]}>:</Text>
+
+              <View style={styles.timeInputContainer}>
+                <TextInput
+                  style={[styles.timeDigitInput, { backgroundColor: colors.cardBg, color: colors.textPrimary, borderColor: colors.borderLight }]}
+                  keyboardType="number-pad"
+                  maxLength={2}
+                  value={customMinute}
+                  onChangeText={setCustomMinute}
+                  placeholder="00"
+                  placeholderTextColor={colors.textMuted}
+                />
+                <Text style={[styles.timeInputSub, { color: colors.textMuted }]}>Min (00-59)</Text>
+              </View>
+
+              <View style={styles.amPmContainer}>
+                <TouchableOpacity
+                  style={[styles.amPmBtn, { backgroundColor: colors.cardBg, borderColor: colors.borderLight }, !isPM && { backgroundColor: colors.primary, borderColor: colors.primary }]}
+                  onPress={() => setIsPM(false)}
+                >
+                  <Text style={[styles.amPmText, { color: !isPM ? '#fff' : colors.textSecondary }]}>AM</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.amPmBtn, { backgroundColor: colors.cardBg, borderColor: colors.borderLight }, isPM && { backgroundColor: colors.primary, borderColor: colors.primary }]}
+                  onPress={() => setIsPM(true)}
+                >
+                  <Text style={[styles.amPmText, { color: isPM ? '#fff' : colors.textSecondary }]}>PM</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <Text style={[styles.sheetSub, { color: colors.textPrimary, marginTop: 14, marginBottom: 8 }]}>Presets</Text>
+            <View style={styles.timeSlotRow}>
+              {[
+                { label: '6:00 PM', h: '06', m: '00', pm: true },
+                { label: '8:00 PM', h: '08', m: '00', pm: true },
+                { label: '9:30 PM', h: '09', m: '30', pm: true },
+                { label: '11:00 PM', h: '11', m: '00', pm: true },
+              ].map((slot, idx) => (
+                <TouchableOpacity
+                  key={idx}
+                  style={[styles.timeSlotBtn, { backgroundColor: colors.subCardBg, borderColor: colors.border }]}
+                  onPress={() => {
+                    setCustomHour(slot.h);
+                    setCustomMinute(slot.m);
+                    setIsPM(slot.pm);
+                  }}
+                >
+                  <Text style={[styles.timeSlotText, { color: colors.textSecondary }]}>{slot.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <TouchableOpacity
+              style={[styles.actionMainBtn, { backgroundColor: colors.primary }]}
+              onPress={handleApplyCustomTime}
+            >
+              <Text style={styles.actionMainBtnText}>Save Custom Reminder</Text>
+            </TouchableOpacity>
           </View>
-        </Modal>
-      </SafeAreaView>
-    </SafeAreaProvider>
+        </View>
+      </Modal>
+
+      {/* Auth Modal */}
+      <AuthModal
+        visible={authModalVisible}
+        initialMode={authModalInitialMode}
+        onClose={() => setAuthModalVisible(false)}
+        onSuccess={(newHandle) => {
+          setOwnerHandle(newHandle);
+          ownerHandleRef.current = newHandle;
+        }}
+        colors={colors}
+        isDarkMode={isDarkMode}
+      />
+
+      {/* Notifications Modal */}
+      <NotificationsModal
+        visible={notifModalVisible}
+        onClose={() => setNotifModalVisible(false)}
+        colors={colors}
+        isDarkMode={isDarkMode}
+      />
+
+      {/* User Profile Modal */}
+      <UserProfileModal
+        visible={userProfileModalVisible}
+        onClose={() => setUserProfileModalVisible(false)}
+        colors={colors}
+        onSignOut={handleSignOutAction}
+      />
+    </SafeAreaView>
+  );
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class RootErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  ErrorBoundaryState
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error('RootErrorBoundary caught unhandled error:', error, errorInfo);
+  }
+
+  handleRestart = () => {
+    this.setState({ hasError: false, error: null });
+  };
+
+  handleResetStorage = async () => {
+    try {
+      await AsyncStorage.multiRemove([
+        '@leetdash_members',
+        '@leetdash_owner_handle',
+        '@leetdash_last_sub_ids',
+        '@leetdash_reminder_settings',
+        '@leetdash_cached_daily_challenge',
+        '@leetdash_cached_member_stats',
+      ]);
+    } catch (_) {}
+    this.setState({ hasError: false, error: null });
+  };
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <SafeAreaView style={{ flex: 1, backgroundColor: '#05070d', justifyContent: 'center', padding: 24 }}>
+          <StatusBar barStyle="light-content" backgroundColor="#05070d" />
+          <View
+            style={{
+              backgroundColor: '#0f172a',
+              padding: 24,
+              borderRadius: 22,
+              borderWidth: 1,
+              borderColor: '#f43f5e50',
+            }}
+          >
+            <Text style={{ fontSize: 36, marginBottom: 12 }}>⚡</Text>
+            <Text style={{ color: '#f8fafc', fontSize: 20, fontWeight: '900', marginBottom: 8 }}>
+              LeetDash Recovery Screen
+            </Text>
+            <Text style={{ color: '#94a3b8', fontSize: 13, lineHeight: 18, marginBottom: 16 }}>
+              {this.state.error?.message || 'A transient rendering issue was encountered.'}
+            </Text>
+
+            <TouchableOpacity
+              style={{
+                backgroundColor: '#ff9900',
+                paddingVertical: 14,
+                borderRadius: 14,
+                alignItems: 'center',
+                marginBottom: 10,
+              }}
+              onPress={this.handleRestart}
+            >
+              <Text style={{ color: '#fff', fontWeight: '900', fontSize: 14 }}>Restart LeetDash</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={{
+                backgroundColor: '#1e293b',
+                paddingVertical: 12,
+                borderRadius: 14,
+                alignItems: 'center',
+              }}
+              onPress={this.handleResetStorage}
+            >
+              <Text style={{ color: '#94a3b8', fontWeight: '800', fontSize: 12 }}>
+                Clear Local Cache & Reset
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </SafeAreaView>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// Wrap with RootErrorBoundary, Safe Area, Auth & Notification Providers
+export default function App() {
+  return (
+    <RootErrorBoundary>
+      <SafeAreaProvider>
+        <AuthProvider>
+          <NotificationProvider>
+            <MainDashboard />
+          </NotificationProvider>
+        </AuthProvider>
+      </SafeAreaProvider>
+    </RootErrorBoundary>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  splashFullOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', zIndex: 999 },
+  splashFullOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, justifyContent: 'center', alignItems: 'center', zIndex: 999 },
   splashContentCenter: { alignItems: 'center', justifyContent: 'center' },
   splashGlowHalo: { position: 'absolute', width: 200, height: 200, borderRadius: 100, backgroundColor: '#ff990020' },
   splashBadgeIcon: { width: 70, height: 70, borderRadius: 22, backgroundColor: '#ff990020', borderWidth: 1.5, borderColor: '#ff990060', alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
@@ -1667,14 +2026,46 @@ const styles = StyleSheet.create({
   splashSubBadge: { marginTop: 12, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 20, backgroundColor: '#ff990015', borderWidth: 1, borderColor: '#ff990040' },
   splashSubBadgeText: { color: '#ff9900', fontSize: 11, fontWeight: '900', letterSpacing: 1.5 },
 
+  inAppToast: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 4,
+    padding: 12,
+    borderRadius: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    zIndex: 99,
+  },
+  inAppToastTitle: { color: '#fff', fontSize: 13, fontWeight: '900' },
+  inAppToastMessage: { color: '#fff', fontSize: 11, opacity: 0.9 },
+
   header: { paddingHorizontal: 16, paddingTop: 14, paddingBottom: 12, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   drawerBtn: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 12, borderWidth: 1 },
   drawerBtnIcon: { fontSize: 16, fontWeight: '900' },
+  notifBtn: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 12, borderWidth: 1, position: 'relative' },
+  notifBadgeCounter: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    borderRadius: 9,
+    minWidth: 18,
+    height: 18,
+    paddingHorizontal: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  notifBadgeText: { color: '#fff', fontSize: 10, fontWeight: '900' },
+
   headerRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   themeToggleBtn: { borderWidth: 1, paddingVertical: 8, paddingHorizontal: 11, borderRadius: 12 },
   themeToggleBtnText: { fontSize: 14, fontWeight: '700' },
   reminderHeaderBtn: { borderWidth: 1, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 12 },
   reminderHeaderBtnText: { fontSize: 12, fontWeight: '800' },
+  userNavBtn: { width: 34, height: 34, borderRadius: 17, borderWidth: 1.5, alignItems: 'center', justifyContent: 'center' },
+  userNavBtnText: { fontSize: 15, fontWeight: '900' },
+  signInNavBtn: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 12 },
+  signInNavBtnText: { color: '#fff', fontSize: 12, fontWeight: '900' },
   todayCountTag: { borderWidth: 1, paddingVertical: 7, paddingHorizontal: 12, borderRadius: 12 },
   todayCountTagText: { fontSize: 12, fontWeight: '800' },
 
@@ -1822,6 +2213,18 @@ const styles = StyleSheet.create({
   onboardingInput: { width: '100%', borderRadius: 14, paddingHorizontal: 16, paddingVertical: 14, fontSize: 15, borderWidth: 1, marginBottom: 16 },
   onboardingBtn: { width: '100%', borderRadius: 14, paddingVertical: 15, alignItems: 'center' },
   onboardingBtnText: { color: '#fff', fontSize: 15, fontWeight: '900' },
+  authAltBtn: {
+    width: '100%',
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: 14,
+    borderWidth: 1,
+  },
+  authAltBtnText: {
+    fontSize: 13,
+    fontWeight: '800',
+  },
 
   drawerProfileBtn: { flexDirection: 'row', alignItems: 'center', padding: 14, borderRadius: 14, borderWidth: 1, gap: 12, marginBottom: 10 },
   drawerAvatar: { width: 44, height: 44, borderRadius: 22 },

@@ -1,0 +1,73 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // User profiles
+    // Users can read any member's profile for the team leaderboard
+    // Users can only create or update their own profile
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId)
+                    && request.resource.data.uid == userId
+                    && request.resource.data.username is string
+                    && request.resource.data.email is string;
+      allow update: if isOwner(userId)
+                    // Cannot change UID or email arbitrarily
+                    && request.resource.data.uid == resource.data.uid;
+      allow delete: if false;
+
+      // Multi-device tokens subcollection
+      match /devices/{deviceId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Unique Username Registry
+    // Prevents duplicate usernames via atomic unique document keys.
+    // Reads are public — availability must be checkable during registration (before auth).
+    // Writes require auth to prevent anonymous username squatting.
+    match /usernames/{username} {
+      allow read: if true;
+      allow create: if isAuthenticated()
+                    && request.resource.data.uid == request.auth.uid
+                    && !exists(/databases/$(database)/documents/usernames/$(username));
+      allow update, delete: if false;
+    }
+
+    // Real-Time Notifications
+    // Only recipient can read or update their own notifications
+    // Authenticated users or backend can create notifications for valid recipients
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && resource.data.recipientId == request.auth.uid;
+      allow create: if isAuthenticated()
+                    && request.resource.data.recipientId is string
+                    && request.resource.data.title is string
+                    && request.resource.data.message is string;
+      allow update: if isAuthenticated()
+                    && resource.data.recipientId == request.auth.uid
+                    // Only allow updating the 'read' status
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'updatedAt']);
+      allow delete: if isAuthenticated() && resource.data.recipientId == request.auth.uid;
+    }
+
+    // OTP verification records
+    // Stored with salted SHA-256 hash (never the raw OTP).
+    // Writes are allowed for anyone — OTP is requested BEFORE the user is authenticated (registration flow).
+    // Reads are also allowed for anyone — OTP verification also happens BEFORE auth is established.
+    // Security: only SHA-256 hash+salt is stored, raw OTP is never persisted. Doc is deleted immediately after verify.
+    // Rate-limiting and expiry are enforced in app logic (RESEND_COOLDOWN_MS, OTP_EXPIRY_MS, MAX_ATTEMPTS).
+    match /otps/{email} {
+      allow read, write: if true;
+    }
+  }
+}
+
